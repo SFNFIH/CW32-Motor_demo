@@ -5,6 +5,7 @@
  */
 #include "BSP_FOC.h"
 #include "BSP_MOTOR.h"
+#include "BSP_Current.h"
 #include "BSP_motor_params.h"
 #include "cw32l012_atim.h"
 #include "cw32l012_btim.h"
@@ -44,16 +45,24 @@
 #define ANG_HOLD_AMP     1100U
 #define ANG_REF_SLEW     160     /* 电位器目标缓变步进 (raw/环) */
 
+#define I_LIM_MIN_MA     120
+#define I_LIM_MAX_MA     1500
+
 static BSP_FOC_State_t s;
 static int8_t s_dir = 1;
 static volatile int8_t s_spin_dir = 1; /* IRQ 相位方向: 速度模式跟 s_dir, 角度模式跟误差 */
-static uint8_t s_ctrl_mode;
+static uint8_t s_ctrl_mode;   /* SPEED / ANGLE / CURRENT (UI) */
+static uint8_t s_motion_mode; /* 外环: SPEED 或 ANGLE (电流设定时保持) */
 static uint16_t s_speed_pm;
 static int32_t s_rpm_ref_x10;
 static int32_t s_rpm_ref_slew;
 static uint16_t s_angle_ref_raw;
 static int32_t s_ang_base;       /* 绝对目标 = base + pot_raw (进角度模式时锁定) */
 static int32_t s_angle_ref_slew; /* 绝对目标缓变 (raw 计数, 可超 ±4096) */
+static uint16_t s_imax_pm;
+static uint16_t s_imax_slew;
+static int32_t s_imax_ma;
+static int32_t s_i_filt_ma;
 
 static uint32_t s_phase;
 static uint32_t s_phase_inc;
@@ -162,6 +171,76 @@ static void apply_spwm(uint8_t ia, uint16_t amp)
 
 static int32_t iabs32(int32_t x) { return (x < 0) ? -x : x; }
 
+static uint8_t motion_is_angle(void)
+{
+    return (s_motion_mode == BSP_FOC_CTRL_ANGLE) ? 1U : 0U;
+}
+
+static void imax_from_pm(uint16_t pm)
+{
+    if (pm > 1000U) { pm = 1000U; }
+    s_imax_pm = pm;
+    s_imax_ma = I_LIM_MIN_MA +
+        ((I_LIM_MAX_MA - I_LIM_MIN_MA) * (int32_t)pm) / 1000;
+}
+
+static void sample_current(void)
+{
+    float ia;
+    float ib;
+    int32_t ima;
+    int32_t imb;
+    int32_t imeas;
+
+    if (BSP_Current_Read(&ia, &ib) != 0U) {
+        ima = (int32_t)(ia * 1000.0f);
+        imb = (int32_t)(ib * 1000.0f);
+        if (ima < 0) { ima = -ima; }
+        if (imb < 0) { imb = -imb; }
+        imeas = ima + imb;
+        s_i_filt_ma = (s_i_filt_ma * 3 + imeas) / 4;
+    }
+    s.i_meas_a = (float)s_i_filt_ma * 0.001f;
+    s.i_lim_a = (float)s_imax_ma * 0.001f;
+}
+
+void BSP_FOC_PollCurrent(void)
+{
+    sample_current();
+}
+
+static void apply_current_loop(void)
+{
+    uint32_t pm;
+    uint32_t amp_lim;
+    uint16_t amp_floor;
+
+    /* Imax 缓变, 避免电流设定时电位器噪声把电压拧抖 */
+    if (s_imax_slew + 40U < s_imax_pm) {
+        s_imax_slew = (uint16_t)(s_imax_slew + 40U);
+    } else if (s_imax_slew > s_imax_pm + 40U) {
+        s_imax_slew = (uint16_t)(s_imax_slew - 40U);
+    } else {
+        s_imax_slew = s_imax_pm;
+    }
+
+    sample_current();
+
+    /* 到位停频: 绝不能再注入 FE_MIN, 否则角环/保持会发抖 */
+    if ((s_fe_cmd <= 0) && (s_phase_inc_tgt == 0U)) {
+        s_amp_tgt = ANG_HOLD_AMP;
+        return;
+    }
+
+    /* 只缩电压(力矩), 不改频率, 避免 V/f 失配失步抖动 */
+    pm = s_imax_slew;
+    if (pm < 120U) { pm = 120U; }
+    amp_lim = ((uint32_t)s_amp_tgt * pm) / 1000U;
+    amp_floor = motion_is_angle() ? 900U : 400U;
+    if (amp_lim < (uint32_t)amp_floor) { amp_lim = amp_floor; }
+    s_amp_tgt = (uint16_t)amp_lim;
+}
+
 static int32_t rpm_to_fe_x10(int32_t rpm_x10)
 {
     int32_t fe = (rpm_x10 * (int32_t)MOTOR_POLE_PAIRS) / 60;
@@ -189,7 +268,7 @@ static void angle_lock_abs(void)
 static void slew_fe_amp(int32_t fe_tgt)
 {
     int32_t up = 2, dn = 8;
-    if (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) {
+    if (motion_is_angle()) {
         /* 角度环加快升频, 缩短到位时间 */
         up = 8;
         dn = 12;
@@ -208,6 +287,7 @@ static void slew_fe_amp(int32_t fe_tgt)
     }
     s_phase_inc_tgt = fe_to_inc((uint32_t)s_fe_cmd);
     s_amp_tgt = fe_to_amp((uint32_t)s_fe_cmd);
+    apply_current_loop();
 }
 
 static void update_rpm_meas(void)
@@ -248,11 +328,19 @@ void BSP_FOC_Init(void)
     s_pi_i = 0;
     s_rpm_ready = 0U;
     s_ctrl_mode = BSP_FOC_CTRL_SPEED;
+    s_motion_mode = BSP_FOC_CTRL_SPEED;
     s_angle_ref_raw = 0U;
     s_ang_base = 0;
     s_angle_ref_slew = 0;
     s_spin_dir = 1;
+    imax_from_pm(1000U);
+    s_imax_slew = 1000U;
+    s_i_filt_ma = 0;
+    s.i_meas_a = 0.0f;
+    s.i_lim_a = (float)I_LIM_MAX_MA * 0.001f;
     BSP_MOTOR_Init();
+    BSP_Current_Init();
+    BSP_Current_Calibrate();
     btn_1ms_init();
 }
 
@@ -270,10 +358,10 @@ void BSP_FOC_Start(void)
     s_rpm_ready = 0U;
     s_slip_cnt = 0U;
     s_spin_dir = s_dir;
-    if ((s_enc_ok != 0U) && (s_ctrl_mode == BSP_FOC_CTRL_ANGLE)) {
+    if ((s_enc_ok != 0U) && motion_is_angle()) {
         angle_lock_abs();
     }
-    s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
+    s.mode = motion_is_angle() ? 3U : 2U;
     s.running = 1U;
     s.isr_cnt = 0U;
     BSP_MOTOR_Start();
@@ -303,16 +391,37 @@ void BSP_FOC_SetAngleRaw(uint16_t raw_0_4095)
     s_angle_ref_raw = raw_0_4095;
 }
 
+void BSP_FOC_SetImaxPm(uint16_t permille)
+{
+    imax_from_pm(permille);
+    s.i_lim_a = (float)s_imax_ma * 0.001f;
+}
+
+uint16_t BSP_FOC_GetImaxPm(void)
+{
+    return s_imax_pm;
+}
+
 void BSP_FOC_SetCtrlMode(uint8_t mode)
 {
-    s_ctrl_mode = (mode == BSP_FOC_CTRL_ANGLE) ? BSP_FOC_CTRL_ANGLE : BSP_FOC_CTRL_SPEED;
-    s_pi_i = 0;
-    s_slip_cnt = 0U;
-    if ((s.running != 0U) && (s_enc_ok != 0U) && (s_ctrl_mode == BSP_FOC_CTRL_ANGLE)) {
-        angle_lock_abs();
+    if (mode == BSP_FOC_CTRL_CURRENT) {
+        s_ctrl_mode = BSP_FOC_CTRL_CURRENT;
+    } else if (mode == BSP_FOC_CTRL_ANGLE) {
+        s_ctrl_mode = BSP_FOC_CTRL_ANGLE;
+        s_motion_mode = BSP_FOC_CTRL_ANGLE;
+        s_pi_i = 0;
+        s_slip_cnt = 0U;
+        if ((s.running != 0U) && (s_enc_ok != 0U)) {
+            angle_lock_abs();
+        }
+    } else {
+        s_ctrl_mode = BSP_FOC_CTRL_SPEED;
+        s_motion_mode = BSP_FOC_CTRL_SPEED;
+        s_pi_i = 0;
+        s_slip_cnt = 0U;
     }
     if (s.running != 0U) {
-        s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
+        s.mode = motion_is_angle() ? 3U : 2U;
     }
 }
 
@@ -321,16 +430,26 @@ uint8_t BSP_FOC_GetCtrlMode(void)
     return s_ctrl_mode;
 }
 
+uint8_t BSP_FOC_GetMotionMode(void)
+{
+    return s_motion_mode;
+}
+
 void BSP_FOC_ToggleCtrlMode(void)
 {
-    BSP_FOC_SetCtrlMode((s_ctrl_mode == BSP_FOC_CTRL_SPEED) ?
-                        BSP_FOC_CTRL_ANGLE : BSP_FOC_CTRL_SPEED);
+    if (s_ctrl_mode == BSP_FOC_CTRL_SPEED) {
+        BSP_FOC_SetCtrlMode(BSP_FOC_CTRL_ANGLE);
+    } else if (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) {
+        BSP_FOC_SetCtrlMode(BSP_FOC_CTRL_CURRENT);
+    } else {
+        BSP_FOC_SetCtrlMode(BSP_FOC_CTRL_SPEED);
+    }
 }
 
 void BSP_FOC_SetDirection(int8_t dir)
 {
     s_dir = (dir >= 0) ? 1 : -1;
-    if (s_ctrl_mode == BSP_FOC_CTRL_SPEED) {
+    if (s_motion_mode == BSP_FOC_CTRL_SPEED) {
         s_spin_dir = s_dir;
     }
 }
@@ -365,13 +484,13 @@ static void run_speed_vf(int32_t rpm_ref_abs, int32_t rpm_meas)
         s.mode = 1U;
         if ((s_fe_cmd > 400) && (rpm_meas < 80)) {
             s_fe_cmd = (int32_t)FE_MIN_X10 + 20;
-            if (s_ctrl_mode == BSP_FOC_CTRL_SPEED) {
+            if (s_motion_mode == BSP_FOC_CTRL_SPEED) {
                 s_rpm_ref_slew = RPM_MIN_X10;
             }
             fe_tgt = s_fe_cmd;
             s.mode = 4U;
         } else {
-            int32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 12 : 3;
+            int32_t step = motion_is_angle() ? 12 : 3;
             fe_tgt = s_fe_cmd + step;
             if (fe_tgt > fe_ff) { fe_tgt = fe_ff; }
             if (fe_tgt < (int32_t)FE_MIN_X10) { fe_tgt = (int32_t)FE_MIN_X10; }
@@ -391,7 +510,7 @@ static void run_speed_vf(int32_t rpm_ref_abs, int32_t rpm_meas)
         if (trim > trim_lim) { trim = trim_lim; }
         if (trim < -trim_lim) { trim = -trim_lim; }
         fe_tgt = fe_ff + trim;
-        s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
+        s.mode = motion_is_angle() ? 3U : 2U;
         {
             int32_t fe_meas = rpm_to_fe_x10(rpm_meas);
             int32_t lead = MAX_LEAD_X10;
@@ -490,6 +609,7 @@ static void loop_angle(void)
         s_fe_cmd = 0;
         s_phase_inc_tgt = 0U;
         s_amp_tgt = ANG_HOLD_AMP;
+        apply_current_loop();
         s_spin_dir = s_dir;
         s.mode = 3U;
     } else {
@@ -518,10 +638,14 @@ static void loop_angle(void)
 void BSP_FOC_SpeedLoop(void)
 {
     if (s.running == 0U) { return; }
-    if (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) {
+    if (motion_is_angle()) {
         loop_angle();
     } else {
         loop_speed();
+    }
+    if (s_ctrl_mode == BSP_FOC_CTRL_CURRENT) {
+        s.id_a = s.i_meas_a;
+        s.iq_a = s.i_lim_a;
     }
 }
 
@@ -550,11 +674,11 @@ void BSP_FOC_PwmIrq(void)
     inc_tgt = s_phase_inc_tgt;
     if (s_phase_inc < inc_tgt) {
         uint32_t d = inc_tgt - s_phase_inc;
-        uint32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 12UL : INC_SLEW_UP;
+        uint32_t step = motion_is_angle() ? 12UL : INC_SLEW_UP;
         s_phase_inc += (d > step) ? step : d;
     } else if (s_phase_inc > inc_tgt) {
         uint32_t d = s_phase_inc - inc_tgt;
-        uint32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 24UL : INC_SLEW_DN;
+        uint32_t step = motion_is_angle() ? 24UL : INC_SLEW_DN;
         s_phase_inc -= (d > step) ? step : d;
     }
 
@@ -563,7 +687,7 @@ void BSP_FOC_PwmIrq(void)
 
     idx = (uint8_t)(s_phase >> 16);
     apply_spwm(idx, amp);
-    if ((s_ctrl_mode != BSP_FOC_CTRL_ANGLE) && ((s.isr_cnt & 127U) == 0U)) {
+    if ((!motion_is_angle()) && ((s.isr_cnt & 127U) == 0U)) {
         s.theta = (float)idx * (6.2831853f / 256.0f);
     }
 }

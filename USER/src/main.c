@@ -1,6 +1,6 @@
 /**
  * @file    main.c
- * @brief   AS5600 速度/角度闭环: 单击启停, 双击切换速度环↔角度环
+ * @brief   单击启停; 双击轮换 速度环 → 角度环 → 电流上限(LED闪)
  */
 #include "main.h"
 #include "BSP_UART.h"
@@ -13,18 +13,22 @@
 #define APP_HCLK_HZ   96000000U
 #define POT_LO        100U
 #define POT_HI        4000U
+#define LED_BLINK_MS  160U
 
 static void SYSCTRL_Configuration(void);
 static void DelayMs(uint32_t ms);
 static uint16_t PotToSpeed(uint16_t adc);
 /** 电位器 ADC → 角度 raw 0..4095 (一圈目标; 闭环用 AS5600 绝对 cum) */
 static uint16_t PotToAngleRaw(uint16_t adc);
+static uint16_t PotToImaxPm(uint16_t adc);
 static void OnClick(void);
 static void OnDoubleClick(void);
+static void UpdateLed(uint8_t motor_on);
 
 static volatile uint8_t s_req_run;
 static volatile uint8_t s_req_mode;
 static uint8_t s_motor_on;
+extern volatile uint32_t g_millis;
 
 void InitTick(uint32_t HclkFreq)
 {
@@ -59,6 +63,11 @@ static uint16_t PotToAngleRaw(uint16_t adc)
     return adc;
 }
 
+static uint16_t PotToImaxPm(uint16_t adc)
+{
+    return PotToSpeed(adc);
+}
+
 static void OnClick(void)
 {
     s_req_run = 1U;
@@ -69,12 +78,35 @@ static void OnDoubleClick(void)
     s_req_mode = 1U;
 }
 
+static void UpdateLed(uint8_t motor_on)
+{
+    static uint32_t s_blink_ms;
+
+    if (motor_on == 0U)
+    {
+        BSP_LED_Off();
+        return;
+    }
+    if (BSP_FOC_GetCtrlMode() == BSP_FOC_CTRL_CURRENT)
+    {
+        if ((g_millis - s_blink_ms) >= LED_BLINK_MS)
+        {
+            s_blink_ms = g_millis;
+            BSP_LED_Tog();
+        }
+        return;
+    }
+    BSP_LED_On();
+}
+
 int main(void)
 {
-    float telemetry[8];
+    float telemetry[10];
     uint16_t pot;
     uint16_t speed;
     uint16_t ang_raw;
+    uint16_t imax_pm;
+    uint8_t ctrl;
 
     SYSCTRL_Configuration();
     InitTick(APP_HCLK_HZ);
@@ -140,6 +172,7 @@ int main(void)
         pot = BSP_Potentiometer_Read();
         speed = PotToSpeed(pot);
         ang_raw = PotToAngleRaw(pot);
+        imax_pm = PotToImaxPm(pot);
         if (g_force_duty != 0U)
         {
             speed = g_force_duty;
@@ -147,8 +180,8 @@ int main(void)
             {
                 speed = 1000U;
             }
-            /* 强制占空比时也映射到角度 raw, 便于脚本测角度环 */
             ang_raw = (uint16_t)(((uint32_t)speed * 4095UL) / 1000UL);
+            imax_pm = speed;
         }
 
         BSP_AS5600_Update();
@@ -157,17 +190,26 @@ int main(void)
         BSP_FOC_OnEncoderRpm(as->rpm_x10);
         BSP_FOC_OnEncoderCum(as->cum_raw);
 
+        ctrl = BSP_FOC_GetCtrlMode();
+        if (ctrl == BSP_FOC_CTRL_CURRENT)
+        {
+            BSP_FOC_SetImaxPm(imax_pm);
+        }
         if (s_motor_on != 0U)
         {
-            if (BSP_FOC_GetCtrlMode() == BSP_FOC_CTRL_ANGLE)
+            if (ctrl == BSP_FOC_CTRL_ANGLE)
             {
                 BSP_FOC_SetAngleRaw(ang_raw);
             }
-            else
+            else if (ctrl == BSP_FOC_CTRL_SPEED)
             {
                 BSP_FOC_SetSpeed(speed);
             }
             BSP_FOC_SpeedLoop();
+        }
+        else
+        {
+            BSP_FOC_PollCurrent();
         }
 
         st = BSP_FOC_GetState();
@@ -176,21 +218,32 @@ int main(void)
             BSP_LED_Off();
             s_motor_on = 0U;
         }
+        UpdateLed(s_motor_on);
         BSP_DebugSnap_Publish(st, pot, s_motor_on);
 
-        /* VOFA: mode, id, iq, theta, as_raw, rpm, ctrl/speed, pot
-         * 速度环: id=fe, iq=rpm_ref, omega 在 id 旁用 ctrl 通道
-         * 角度环: id=amp, iq=目标角°, omega=实测角° → 通道6 放 ctrl_mode */
+        /* VOFA: 电流设定时 id=实测A iq=ImaxA; 否则沿用速度/角度含义 */
         telemetry[0] = (float)st->mode;
         telemetry[1] = st->id_a;
         telemetry[2] = st->iq_a;
         telemetry[3] = st->theta;
         telemetry[4] = (float)as->raw;
         telemetry[5] = st->rpm;
-        telemetry[6] = (BSP_FOC_GetCtrlMode() == BSP_FOC_CTRL_ANGLE) ?
-                       st->omega_e : (float)speed;
+        if (ctrl == BSP_FOC_CTRL_CURRENT)
+        {
+            telemetry[6] = (float)BSP_FOC_GetImaxPm();
+        }
+        else if (ctrl == BSP_FOC_CTRL_ANGLE)
+        {
+            telemetry[6] = st->omega_e;
+        }
+        else
+        {
+            telemetry[6] = (float)speed;
+        }
         telemetry[7] = (float)pot;
-        BSP_UART_SendJustFloat(telemetry, 8U);
+        telemetry[8] = st->i_lim_a;   /* 设定电流 Imax (A) */
+        telemetry[9] = st->i_meas_a;  /* 实时电流 (A) */
+        BSP_UART_SendJustFloat(telemetry, 10U);
         DelayMs(2U);
     }
 }

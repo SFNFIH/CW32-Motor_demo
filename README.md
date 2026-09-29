@@ -1,9 +1,9 @@
 # CW32L012 + DengFOC 2208 无刷电机控制
 
 基于 **CW32L012C8**（Cortex-M0+，HSI 96 MHz）的三相无刷电机控制工程。  
-控制路径：**互补 SPWM / 中点注入 SVPWM + 开环 V/f**，AS5600 测速 / 测角；电位器给定，按键启停与模式切换。
+控制路径：**互补 SPWM / 中点注入 SVPWM + 开环 V/f**，AS5600 测速 / 测角，相电流采样做 **Imax 上限**。
 
-当前分支 **`feature/angle-loop`**：在速度闭环之外增加 **绝对位置角度环**。
+当前分支 **`feature/current-loop`**：在速度环、绝对位置角度环之上，用双击第三态设定电流上限，并叠加到两个外环。
 
 ---
 
@@ -14,28 +14,30 @@
 | 电机 | DengFOC 2208，7 极对，相电阻约 8 Ω，母线约 12 V |
 | 驱动波形 | ATIM 中心对齐互补 PWM，约 **15 kHz**，带死区；中点注入近似 SVPWM |
 | 速度环 | 电位器 → 约 **15～1350 rpm**（12 V 下可同步上限约 1200 rpm） |
-| 角度环 | 电位器 **0～4095** 对应机械角 **0～360°**；反馈用 AS5600 **累计角 `cum_raw`**，转过整圈仍能回到目标 |
+| 角度环 | 电位器 **0～4095** → **0～360°**；反馈用 AS5600 **`cum_raw` 绝对多圈**，转过整圈仍能回位 |
+| 电流上限 | 电位器设定 **Imax（约 0.12～1.5 A）**，按比例限制调制电压，**叠加**在速度/角度上 |
 | 速度/位置反馈 | AS5600，**硬件 I2C1** |
-| 控制 | 速度：`fe` 前馈 + PI 微调；角度：位置误差 → 转速指令 → 同一套 V/f |
-| 通信 | UART1 JustFloat（VOFA+）；PyOCD 可读 `g_dbg` 快照 |
-| 操作 | **单击**启停；**双击**在速度环 ↔ 角度环之间切换 |
+| 电流反馈 | 片内 OPA + ADC1（PB0 / PB1） |
+| 通信 | UART1 JustFloat（VOFA+，**10 通道**）；PyOCD 可读 `g_dbg` |
+| 操作 | **单击**启停；**双击**轮换：速度 → 角度 → 电流上限（LED 闪烁） |
 
-> **12 V 限制：** 反电势会把开环同步速度顶在约 **1200 rpm** 附近；再高需要弱磁或升压。  
-> **换向：** `BSP_FOC_ToggleDirection()` / `BSP_FOC_SetDirection()` API 仍保留，默认按键 **不再换向**。
+> **说明：** 这不是 `Id/Iq` FOC 电流环，而是 V/f 外环 + 电流上限。`BSP_FOC_ToggleDirection()` 仍保留，默认按键 **不再换向**。  
+> **12 V：** 反电势大约把同步转速顶在 **1200 rpm**。
 
 ---
 
 ## 操作说明
 
-1. 接好电机、12 V 母线、AS5600、电位器。  
-2. 烧录后复位，LED 未亮表示停机。  
-3. **单击按键**启动。  
-4. **速度环：** 拧电位器调速（建议从低速慢慢升高）。约 **40 rpm** 起可较稳跟随；**100～300 rpm** 已做 V/f 与 PI 柔化。  
-5. **双击**切入 **角度环**：电位器 0 → 该圈 **0°**，满量程 → 约 **4095 raw（360°）**。  
-6. 角度环下若手转电机超过 360°，松开后仍会沿最短绝对路径回到电位器目标（不取模到 ±180°）。  
-7. 再 **单击** 停止。
+1. 接好电机、12 V、AS5600、电位器、电流采样。  
+2. 烧录后复位，LED 灭 = 停机。  
+3. **单击**启动（LED 常亮）。  
+4. **速度环：** 电位器调速，建议从低速慢慢升高。  
+5. **双击 → 角度环：** 电位器 0 → 该圈 0°，满量程 → 约 4095 raw。超圈后仍按绝对位置回去。  
+6. **再双击 → 电流上限：** LED **闪烁**。电位器只改 **Imax**，刚才的速度/角度外环继续跑。拧小电位器，设定电流下降、力矩变弱。  
+7. **再双击**回到速度环（LED 常亮），**Imax 记住**，直到下次再进电流设定。  
+8. **单击**停止。
 
-高于约 **1120～1200 rpm** 会接近 12 V 反电势上限，继续拧电位器不会明显再升速，但应保持同步而不失步崩溃。
+VOFA+ 请把通道数设为 **10**。看 **通道 8（设定电流）** 和 **通道 9（实时电流）** 是否跟着电位器和负载变化。
 
 ---
 
@@ -57,141 +59,120 @@
 | SCL | PC15 |
 | 地址 | `0x36` |
 
-与参考例程 `cw32l012_i2c_master_int` 一致：开漏 + 内部上拉，100 kHz。
+开漏 + 内部上拉，100 kHz（与 `cw32l012_i2c_master_int` 一致）。
 
-### 人机与调试
+### 人机、电流与调试
 
 | 功能 | 引脚 |
 |------|------|
 | 按键（低有效，内部上拉） | PB10 |
 | 电位器 ADC | PA9 → ADC2 CH6 |
+| 电流 A | OPA1 → PB0 → ADC1 CH8 |
+| 电流 B | OPA2 → PB1 → ADC1 CH9 |
 | UART1 TX / RX | PB12 / PB11，115200 |
 | LED | PC13（低电平点亮） |
 | SWD | SWDIO / SWCLK / 5V / GND |
 
-原理图见 `Doc/` 目录。
+原理图见 `Doc/`。
 
 ---
 
 ## 软件架构
 
 ```
-USER/src/main.c          主循环: 电位器、AS5600、速度/角度环、遥测
-BSP/BSP_FOC.c            V/f 速度闭环 + 绝对位置角度环 + SPWM 中断
+USER/src/main.c          主循环: 电位器、AS5600、三态模式、JustFloat
+BSP/BSP_FOC.c            V/f 速度 + 绝对角度 + Imax 电压缩放
+BSP/BSP_Current.c        A/B 相电流 (OPA + ADC1)
 BSP/BSP_MOTOR.c          ATIM 互补 PWM
-BSP/BSP_AS5600.c         硬件 I2C 磁编（含 cum_raw 多圈展开）
+BSP/BSP_AS5600.c         硬件 I2C 磁编（cum_raw 多圈）
 BSP/BSP_Button.c         单击 / 双击
 BSP/BSP_Potentiometer.c  电位器
 BSP/BSP_UART.c           JustFloat
-BSP/BSP_DebugSnap.c      PyOCD 调试快照 g_dbg
+BSP/BSP_DebugSnap.c      PyOCD g_dbg
 Libraries/               CW32 标准外设库
 ```
 
-### 速度环（`BSP_FOC.c`）
+### 速度环
 
-1. 电位器映射目标转速，斜坡限速。  
-2. AS5600 累计角 + `g_millis` 测机械转速。  
-3. 目标转速 → 电频率 `fe` 前馈；PI 只做小范围修正。  
-4. 中低速降低调制幅度，限制相对实测的 `fe` 超前，避免拧飞失步。  
-5. PWM 中断里推进相位并输出三相占空比；启停只由主循环按键回调处理。
+电位器 → 目标转速（斜坡）→ `fe` 前馈 + 小 PI；中低速压幅、限超前，减轻失步。
 
 ### 角度环
 
-1. 进入角度模式时锁定圈基址，使 **电位器 0 对准该圈 0°**。  
-2. 目标 = `base + 电位器 raw（0～4095）`；反馈用 **`cum_raw` 绝对误差**（不折到 ±180°）。  
-3. 位置误差经比例得到转速指令，再走原有 V/f；到位死区内停频、小幅保持。  
-4. 目标与实测在 VOFA 上以「相对当前圈」的角度显示（超圈时可超出 0～360°）。
+进模式时锁定圈基址，使电位器 0 对准该圈 0°。绝对误差 `目标 − cum` 不取模。到位后 **停频 + 保持电压**（不再注入最低转速，避免发抖）。
+
+### 电流上限（内环叠加）
+
+- 第三态：电位器 → `Imax`，LED 闪烁。  
+- 对速度/角度 **只缩小调制电压、不改频率**；角度到位时保持停频。  
+- `Imax` 缓变，减轻电位器噪声。  
+- 尚无 Park/`Iq` 闭环，通道 9 为相电流绝对值之和的滤波，便于对照设定值。
 
 ---
 
 ## 环境依赖
 
-- `arm-none-eabi-gcc`（可用 STM32CubeCLT 自带工具链）
+- `arm-none-eabi-gcc`（可用 STM32CubeCLT）
 - CMake ≥ 3.22
-- Python3 + **pyOCD**（建议独立 venv）
-- CMSIS Pack：`WHXY/CW32L012_DFP`（不在公网索引，需本地安装）
-
-Pack 默认路径：
+- Python3 + **pyOCD**
+- CMSIS Pack：`WHXY/CW32L012_DFP`
 
 ```text
 ~/.local/share/cmsis-pack-manager/WHXY/CW32L012_DFP/1.0.2.pack
 ```
 
-安装 / 更新：
-
 ```bash
 python3 scripts/install_cw32_pack.py
-# 或指定本地 pack：
 python3 scripts/install_cw32_pack.py /path/to/WHXY.CW32L012_DFP.1.0.2.pack
 ```
 
 ---
 
-## 编译
+## 编译与烧录
 
 ```bash
 cmake --preset Debug
 cmake --build build/Debug -j
-```
-
-产物：
-
-- `build/Debug/cw32l012_blank.elf`
-- 同目录 `.hex` / `.bin`
-
----
-
-## 烧录
-
-关闭占用调试口的串口软件后：
-
-```bash
 python3 flash_cw32.py build/Debug/cw32l012_blank.elf
 ```
 
-或：
-
-```bash
-/home/tony/DAPLink/third_party/DAPLink/venv/bin/python flash_cw32.py
-```
-
-`pyocd.yml` 已配置目标 `cw32l012c8` 与 pack 路径。连接方式：`under-reset`。
+产物：`build/Debug/cw32l012_blank.elf`（同目录 `.hex` / `.bin`）。  
+`pyocd.yml`：目标 `cw32l012c8`，`under-reset`。烧录前请关掉占用串口的软件。
 
 ---
 
-## 调试与遥测
+## VOFA+ JustFloat
 
-### VOFA+ JustFloat
+UART1 发送 **10** 个 float + 帧尾 `00 00 80 7F`。
 
-UART1 周期发送 8 个 float：
+| 通道 | 速度环 | 角度环 | 电流设定（LED 闪） |
+|------|--------|--------|-------------------|
+| 0 | mode（0 停 / 1 爬升 / 2 速度 / 3 角度 / 4 失步恢复） | 同左 | 同左 |
+| 1 | `fe_x10` | 调制幅度 | 同外环遗留字段 |
+| 2 | 目标转速 (rpm) | 目标角 (°) | 同外环遗留字段 |
+| 3 | 电角度抽样 | 累计角 (rad) | 同外环 |
+| 4 | AS5600 raw | 同左 | 同左 |
+| 5 | 实测转速 (rpm) | 同左 | 同左 |
+| 6 | 电位器 0～1000 | 实测角 (°) | Imax 千分比 |
+| 7 | 电位器 ADC | 同左 | 同左 |
+| **8** | **设定电流 Imax (A)** | 同左 | 拧电位器变化 |
+| **9** | **实时电流 (A)** | 同左 | 同左 |
 
-| 序号 | 速度环 | 角度环 |
-|------|--------|--------|
-| 0 | mode（0 停 / 1 开环爬升 / 2 速度闭环 / 3 角度闭环 / 4 失步恢复） | 同左 |
-| 1 | `fe_x10` 指令 | 调制幅度 amp |
-| 2 | 目标转速（rpm） | 目标角（相对当前圈，度；可 >360） |
-| 3 | 电角度抽样（rad） | 累计角（rad） |
-| 4 | AS5600 raw（0～4095） | 同左 |
-| 5 | 实测转速（rpm） | 同左 |
-| 6 | 电位器归一化 0～1000 | 实测角（相对当前圈，度） |
-| 7 | 电位器 ADC | 同左 |
+建议在 VOFA 把通道 8、9 命名为 `Iset`、`Imeas`。
 
-### PyOCD 快照
+### PyOCD
 
-全局 `g_dbg`（见 `BSP_DebugSnap.h`）含 `as_ok`、`as_raw`、`as_cum`、mode 等。  
-可用 `scripts/pyocd_loop_debug.py` 或自写脚本读写；`g_force_duty` 非 0 时可强制速度给定（角度环下同时映射到角度 raw）。
-
-注意：用调试器 **halt** 测转速会干扰时序；应用 `as_cum` 在运行中做墙钟差分更可靠。
+`g_dbg`（`BSP_DebugSnap.h`）：`as_ok`、`as_raw`、`as_cum`、mode 等。  
+`g_force_duty` 非 0 时强制速度给定（角度/电流映射见 `main.c`）。不要用 halt 测转速。
 
 ---
 
 ## 已知限制
 
-- 当前为 **开环 V/f + 编码器测速 / 测角**，不是电流环 FOC；极低速顺滑度、抗负载能力有限。  
-- 母线约 12 V 时机械转速上限约 **1.2 krpm** 量级。  
-- 角度环到位有小死区（约 6 raw），两端可能仍有数码偏差。  
-- 仓库内仍有 `BSP_Sensorless` / `BSP_BEMF` / `BSP_Current` 等历史模块，默认未接入 `main`。  
-- I2C 与电机同板时请保证地线良好；AS5600 需磁铁对准、`STATUS.MD` 有效。
+- 开环 V/f + 编码器 + **电流上限**，不是 FOC `Id/Iq` 环。  
+- 12 V 机械转速大约 **1.2 krpm** 封顶。  
+- 角度到位有死区（约 6 raw）。  
+- 电流上限有电压下限，避免锁角时电压过低发抖，因此 Imax 拧到很小也可能仍有一点力矩。  
+- `BSP_Sensorless` / `BSP_BEMF` 等历史模块默认未接入。
 
 ---
 
@@ -200,12 +181,12 @@ UART1 周期发送 8 个 float：
 | 路径 | 说明 |
 |------|------|
 | `BSP/` | 板级驱动与控制 |
-| `USER/` | `main`、中断、`SystemInit` 覆盖 |
+| `USER/` | `main`、中断、`SystemInit` |
 | `Libraries/` | CW32 外设库 |
-| `Doc/` | 原理图等资料 |
-| `cmake/` | `arm-none-eabi` 工具链 |
-| `scripts/` | pack 安装、调试辅助 |
-| `flash_cw32.py` | pyOCD 烧录入口 |
+| `Doc/` | 原理图 |
+| `cmake/` | 工具链 |
+| `scripts/` | pack 安装、调试 |
+| `flash_cw32.py` | pyOCD 烧录 |
 | `cw32l012_flash.ld` | 链接脚本 |
 | `startup_cw32l012x8.s` | 启动文件 |
 
@@ -213,4 +194,4 @@ UART1 周期发送 8 个 float：
 
 ## License
 
-本仓库以学习与个人开发为目的；CW32 库文件请遵循原厂许可。
+学习与个人开发用途；CW32 库文件遵循原厂许可。

@@ -42,6 +42,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/BSP_Button.c
     BSP/BSP_MOTOR.c
     BSP/BSP_FOC.c
+    BSP/BSP_Current.c
     BSP/BSP_AS5600.c
     BSP/BSP_DebugSnap.c
     USER/src/main.c
