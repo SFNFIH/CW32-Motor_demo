@@ -1,6 +1,6 @@
 /**
  * @file    main.c
- * @brief   AS5600 速度闭环: 电位器给转速目标, 磁编反馈
+ * @brief   AS5600 速度/角度闭环: 单击启停, 双击切换速度环↔角度环
  */
 #include "main.h"
 #include "BSP_UART.h"
@@ -17,11 +17,13 @@
 static void SYSCTRL_Configuration(void);
 static void DelayMs(uint32_t ms);
 static uint16_t PotToSpeed(uint16_t adc);
+/** 电位器 ADC → 角度 raw 0..4095 (一圈目标; 闭环用 AS5600 绝对 cum) */
+static uint16_t PotToAngleRaw(uint16_t adc);
 static void OnClick(void);
 static void OnDoubleClick(void);
 
 static volatile uint8_t s_req_run;
-static volatile uint8_t s_req_dir;
+static volatile uint8_t s_req_mode;
 static uint8_t s_motor_on;
 
 void InitTick(uint32_t HclkFreq)
@@ -47,6 +49,16 @@ static uint16_t PotToSpeed(uint16_t adc)
     return (uint16_t)x;
 }
 
+static uint16_t PotToAngleRaw(uint16_t adc)
+{
+    /* 0..4095 → 角度 raw 0..4095 (与 AS5600 一圈对齐); ≥4095 夹到满量程 */
+    if (adc >= 4095U)
+    {
+        return 4095U;
+    }
+    return adc;
+}
+
 static void OnClick(void)
 {
     s_req_run = 1U;
@@ -54,7 +66,7 @@ static void OnClick(void)
 
 static void OnDoubleClick(void)
 {
-    s_req_dir = 1U;
+    s_req_mode = 1U;
 }
 
 int main(void)
@@ -62,6 +74,7 @@ int main(void)
     float telemetry[8];
     uint16_t pot;
     uint16_t speed;
+    uint16_t ang_raw;
 
     SYSCTRL_Configuration();
     InitTick(APP_HCLK_HZ);
@@ -98,7 +111,8 @@ int main(void)
         }
         else if (cmd == DBG_CMD_TOGGLE_DIR)
         {
-            s_req_dir = 1U;
+            /* 调试口复用为模式切换 (不再换向) */
+            s_req_mode = 1U;
         }
 
         if (s_req_run != 0U)
@@ -117,14 +131,15 @@ int main(void)
                 BSP_FOC_Start();
             }
         }
-        if (s_req_dir != 0U)
+        if (s_req_mode != 0U)
         {
-            s_req_dir = 0U;
-            BSP_FOC_ToggleDirection();
+            s_req_mode = 0U;
+            BSP_FOC_ToggleCtrlMode();
         }
 
         pot = BSP_Potentiometer_Read();
         speed = PotToSpeed(pot);
+        ang_raw = PotToAngleRaw(pot);
         if (g_force_duty != 0U)
         {
             speed = g_force_duty;
@@ -132,6 +147,8 @@ int main(void)
             {
                 speed = 1000U;
             }
+            /* 强制占空比时也映射到角度 raw, 便于脚本测角度环 */
+            ang_raw = (uint16_t)(((uint32_t)speed * 4095UL) / 1000UL);
         }
 
         BSP_AS5600_Update();
@@ -142,7 +159,14 @@ int main(void)
 
         if (s_motor_on != 0U)
         {
-            BSP_FOC_SetSpeed(speed);
+            if (BSP_FOC_GetCtrlMode() == BSP_FOC_CTRL_ANGLE)
+            {
+                BSP_FOC_SetAngleRaw(ang_raw);
+            }
+            else
+            {
+                BSP_FOC_SetSpeed(speed);
+            }
             BSP_FOC_SpeedLoop();
         }
 
@@ -154,14 +178,17 @@ int main(void)
         }
         BSP_DebugSnap_Publish(st, pot, s_motor_on);
 
-        /* VOFA: mode, fe_x10, rpm_ref, theta, as_raw, rpm_meas, speed_pm, pot */
+        /* VOFA: mode, id, iq, theta, as_raw, rpm, ctrl/speed, pot
+         * 速度环: id=fe, iq=rpm_ref, omega 在 id 旁用 ctrl 通道
+         * 角度环: id=amp, iq=目标角°, omega=实测角° → 通道6 放 ctrl_mode */
         telemetry[0] = (float)st->mode;
-        telemetry[1] = st->id_a;          /* fe_x10 指令 */
-        telemetry[2] = st->iq_a;          /* 目标 rpm */
+        telemetry[1] = st->id_a;
+        telemetry[2] = st->iq_a;
         telemetry[3] = st->theta;
         telemetry[4] = (float)as->raw;
-        telemetry[5] = st->rpm;           /* 实测 rpm */
-        telemetry[6] = (float)speed;
+        telemetry[5] = st->rpm;
+        telemetry[6] = (BSP_FOC_GetCtrlMode() == BSP_FOC_CTRL_ANGLE) ?
+                       st->omega_e : (float)speed;
         telemetry[7] = (float)pot;
         BSP_UART_SendJustFloat(telemetry, 8U);
         DelayMs(2U);

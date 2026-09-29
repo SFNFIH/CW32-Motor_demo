@@ -1,7 +1,7 @@
 /**
  * @file    BSP_FOC.c
- * @brief   速度闭环 V/f + AS5600 测速; 降低下限以支持低速
- *          (角度闭环待 V/f 低速验证后再加)
+ * @brief   速度闭环 V/f + 角度闭环 (电位器 0..4096 → 0..360°, 绝对多圈可回位)
+ *          ToggleDirection / SetDirection API 保留; 模式由 ToggleCtrlMode 切换
  */
 #include "BSP_FOC.h"
 #include "BSP_MOTOR.h"
@@ -12,13 +12,12 @@
 
 #define SIN_N            256U
 
-#define RPM_MIN_X10      150     /* 15 rpm */
-#define RPM_MAX_X10      13500   /* 1350 rpm */
+#define RPM_MIN_X10      150
+#define RPM_MAX_X10      13500
 
-#define FE_MIN_X10       20U     /* 2 Hz 电 ≈ 17 rpm @7pp */
+#define FE_MIN_X10       20U
 #define FE_MAX_X10       1800U
 
-/* 低速勿顶满: 100~300rpm 过压会齿槽抖 */
 #define AMP_MIN          950U
 #define AMP_MAX          3200U
 
@@ -26,7 +25,7 @@
 #define INC_SLEW_DN      16UL
 
 #define MAX_LEAD_X10     120
-#define MAX_LEAD_LS_X10  50      /* <400rpm 更紧 */
+#define MAX_LEAD_LS_X10  50
 #define MAX_LEAD_HS_X10  140
 #define TRIM_MAX         100
 #define TRIM_MAX_LS      40
@@ -36,13 +35,25 @@
 #define SP_KI_NUM        1
 #define SP_KI_DEN        400
 #define SP_I_LIM         50000L
-#define ERR_DEAD_X10     80      /* |err|<8rpm 不积分, 减测速噪声拧频 */
+#define ERR_DEAD_X10     80
+
+#define ANG_DEAD_RAW     6       /* 过宽会提前停住: 如目标4095停在4070 */
+#define ANG_KP_NUM       5       /* 位置→转速增益 (越大跟得越快) */
+#define ANG_KP_DEN       1
+#define ANG_RPM_MAX_X10  8000    /* 角度环最大追赶转速 800 rpm */
+#define ANG_HOLD_AMP     1100U
+#define ANG_REF_SLEW     160     /* 电位器目标缓变步进 (raw/环) */
 
 static BSP_FOC_State_t s;
 static int8_t s_dir = 1;
+static volatile int8_t s_spin_dir = 1; /* IRQ 相位方向: 速度模式跟 s_dir, 角度模式跟误差 */
+static uint8_t s_ctrl_mode;
 static uint16_t s_speed_pm;
 static int32_t s_rpm_ref_x10;
 static int32_t s_rpm_ref_slew;
+static uint16_t s_angle_ref_raw;
+static int32_t s_ang_base;       /* 绝对目标 = base + pot_raw (进角度模式时锁定) */
+static int32_t s_angle_ref_slew; /* 绝对目标缓变 (raw 计数, 可超 ±4096) */
 
 static uint32_t s_phase;
 static uint32_t s_phase_inc;
@@ -51,6 +62,7 @@ static volatile uint16_t s_amp;
 static volatile uint16_t s_amp_tgt;
 
 static volatile uint8_t s_enc_ok;
+static volatile uint16_t s_enc_raw;
 static volatile int32_t s_enc_cum;
 
 static int32_t s_pi_i;
@@ -105,23 +117,15 @@ static uint32_t fe_to_inc(uint32_t fe_x10)
 
 static uint16_t fe_to_amp(uint32_t fe_x10)
 {
-    /* 分段 V/f: 中低速柔和, 高速再过调制
-     * fe≈117(100rpm)→~1180, fe≈350(300rpm)→~1550, fe≥1000→满 */
-    if (fe_x10 <= FE_MIN_X10)
-    {
-        return AMP_MIN;
-    }
-    if (fe_x10 < 120U)
-    {
+    if (fe_x10 <= FE_MIN_X10) { return AMP_MIN; }
+    if (fe_x10 < 120U) {
         return (uint16_t)(AMP_MIN + ((1200U - AMP_MIN) * (fe_x10 - FE_MIN_X10)) /
                            (120U - FE_MIN_X10));
     }
-    if (fe_x10 < 400U)
-    {
+    if (fe_x10 < 400U) {
         return (uint16_t)(1200U + ((1650U - 1200U) * (fe_x10 - 120U)) / (400U - 120U));
     }
-    if (fe_x10 < 1000U)
-    {
+    if (fe_x10 < 1000U) {
         return (uint16_t)(1650U + ((AMP_MAX - 1650U) * (fe_x10 - 400U)) / (1000U - 400U));
     }
     return AMP_MAX;
@@ -166,10 +170,88 @@ static int32_t rpm_to_fe_x10(int32_t rpm_x10)
     return fe;
 }
 
+/* 将 x 四舍五入到最近的 4096 倍数 (一圈) */
+static int32_t round_mul_4096(int32_t x)
+{
+    if (x >= 0) {
+        return ((x + 2048) / 4096) * 4096;
+    }
+    return -(((-x + 2048) / 4096) * 4096);
+}
+
+/* pot=0 → 该圈绝对 0; pot=4095 → 近 360°; 超圈后仍按 cum 回位 */
+static void angle_lock_abs(void)
+{
+    s_ang_base = round_mul_4096(s_enc_cum - (int32_t)s_angle_ref_raw);
+    s_angle_ref_slew = s_enc_cum;
+}
+
+static void slew_fe_amp(int32_t fe_tgt)
+{
+    int32_t up = 2, dn = 8;
+    if (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) {
+        /* 角度环加快升频, 缩短到位时间 */
+        up = 8;
+        dn = 12;
+    } else if (s_fe_cmd > 1200) {
+        up = 2;
+    } else if (s_fe_cmd < 400) {
+        up = 1;
+        dn = 4;
+    }
+    if (s_fe_cmd < fe_tgt) {
+        s_fe_cmd += up;
+        if (s_fe_cmd > fe_tgt) { s_fe_cmd = fe_tgt; }
+    } else if (s_fe_cmd > fe_tgt) {
+        s_fe_cmd -= dn;
+        if (s_fe_cmd < fe_tgt) { s_fe_cmd = fe_tgt; }
+    }
+    s_phase_inc_tgt = fe_to_inc((uint32_t)s_fe_cmd);
+    s_amp_tgt = fe_to_amp((uint32_t)s_fe_cmd);
+}
+
+static void update_rpm_meas(void)
+{
+    uint32_t now = g_millis;
+    if (s_rpm_ready == 0U) {
+        s_cum_prev = s_enc_cum;
+        s_ms_prev = now;
+        s_rpm_ready = 1U;
+        s_rpm_filt = 0;
+        return;
+    }
+    {
+        uint32_t dt = now - s_ms_prev;
+        uint32_t need = (s_rpm_filt < 4000) ? 100U : 40U;
+        if (dt >= need) {
+            int32_t dc = s_enc_cum - s_cum_prev;
+            int32_t inst = (dc * 600000L) / ((int32_t)dt * 4096L);
+            if (inst > 25000L) { inst = 25000L; }
+            if (inst < -25000L) { inst = -25000L; }
+            if (iabs32(inst) < 4000) {
+                s_rpm_filt = (s_rpm_filt * 5 + iabs32(inst)) / 6;
+            } else {
+                s_rpm_filt = (s_rpm_filt * 2 + iabs32(inst)) / 3;
+            }
+            s_cum_prev = s_enc_cum;
+            s_ms_prev = now;
+        }
+    }
+}
+
 void BSP_FOC_Init(void)
 {
-    s.mode = 0U; s.running = 0U; s.isr_cnt = 0U;
-    s_enc_ok = 0U; s_pi_i = 0; s_rpm_ready = 0U;
+    s.mode = 0U;
+    s.running = 0U;
+    s.isr_cnt = 0U;
+    s_enc_ok = 0U;
+    s_pi_i = 0;
+    s_rpm_ready = 0U;
+    s_ctrl_mode = BSP_FOC_CTRL_SPEED;
+    s_angle_ref_raw = 0U;
+    s_ang_base = 0;
+    s_angle_ref_slew = 0;
+    s_spin_dir = 1;
     BSP_MOTOR_Init();
     btn_1ms_init();
 }
@@ -187,7 +269,11 @@ void BSP_FOC_Start(void)
     s_rpm_ref_slew = RPM_MIN_X10;
     s_rpm_ready = 0U;
     s_slip_cnt = 0U;
-    s.mode = 2U;
+    s_spin_dir = s_dir;
+    if ((s_enc_ok != 0U) && (s_ctrl_mode == BSP_FOC_CTRL_ANGLE)) {
+        angle_lock_abs();
+    }
+    s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
     s.running = 1U;
     s.isr_cnt = 0U;
     BSP_MOTOR_Start();
@@ -196,7 +282,8 @@ void BSP_FOC_Start(void)
 
 void BSP_FOC_Stop(void)
 {
-    s.running = 0U; s.mode = 0U;
+    s.running = 0U;
+    s.mode = 0U;
     BSP_MOTOR_DisablePwmIrq();
     BSP_MOTOR_Stop();
 }
@@ -210,23 +297,135 @@ void BSP_FOC_SetSpeed(uint16_t speed_permille)
         ((int32_t)(RPM_MAX_X10 - RPM_MIN_X10) * (int32_t)sp) / 1000;
 }
 
-void BSP_FOC_SetDirection(int8_t dir) { s_dir = (dir >= 0) ? 1 : -1; }
-void BSP_FOC_ToggleDirection(void) { s_dir = (int8_t)(-s_dir); }
+void BSP_FOC_SetAngleRaw(uint16_t raw_0_4095)
+{
+    if (raw_0_4095 > 4095U) { raw_0_4095 = 4095U; }
+    s_angle_ref_raw = raw_0_4095;
+}
+
+void BSP_FOC_SetCtrlMode(uint8_t mode)
+{
+    s_ctrl_mode = (mode == BSP_FOC_CTRL_ANGLE) ? BSP_FOC_CTRL_ANGLE : BSP_FOC_CTRL_SPEED;
+    s_pi_i = 0;
+    s_slip_cnt = 0U;
+    if ((s.running != 0U) && (s_enc_ok != 0U) && (s_ctrl_mode == BSP_FOC_CTRL_ANGLE)) {
+        angle_lock_abs();
+    }
+    if (s.running != 0U) {
+        s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
+    }
+}
+
+uint8_t BSP_FOC_GetCtrlMode(void)
+{
+    return s_ctrl_mode;
+}
+
+void BSP_FOC_ToggleCtrlMode(void)
+{
+    BSP_FOC_SetCtrlMode((s_ctrl_mode == BSP_FOC_CTRL_SPEED) ?
+                        BSP_FOC_CTRL_ANGLE : BSP_FOC_CTRL_SPEED);
+}
+
+void BSP_FOC_SetDirection(int8_t dir)
+{
+    s_dir = (dir >= 0) ? 1 : -1;
+    if (s_ctrl_mode == BSP_FOC_CTRL_SPEED) {
+        s_spin_dir = s_dir;
+    }
+}
+
+void BSP_FOC_ToggleDirection(void)
+{
+    BSP_FOC_SetDirection((int8_t)(-s_dir));
+}
 
 void BSP_FOC_OnEncoder(uint16_t raw, uint8_t ok)
 {
-    (void)raw;
+    s_enc_raw = raw;
     s_enc_ok = ok;
 }
+
 void BSP_FOC_OnEncoderRpm(int32_t rpm_x10) { (void)rpm_x10; }
 void BSP_FOC_OnEncoderCum(int32_t cum_raw) { s_enc_cum = cum_raw; }
 
-void BSP_FOC_SpeedLoop(void)
+static void run_speed_vf(int32_t rpm_ref_abs, int32_t rpm_meas)
 {
-    int32_t rpm_meas, rpm_ref, err, trim, fe_ff, fe_tgt;
-    uint32_t now;
+    int32_t fe_ff = rpm_to_fe_x10(rpm_ref_abs);
+    int32_t fe_tgt;
+    int32_t err;
+    int32_t trim;
 
-    if (s.running == 0U) { return; }
+    if (s_enc_ok == 0U) {
+        s_pi_i = 0;
+        fe_tgt = fe_ff;
+        s.mode = 1U;
+    } else if (rpm_meas < 200) {
+        s_pi_i = 0;
+        s.mode = 1U;
+        if ((s_fe_cmd > 400) && (rpm_meas < 80)) {
+            s_fe_cmd = (int32_t)FE_MIN_X10 + 20;
+            if (s_ctrl_mode == BSP_FOC_CTRL_SPEED) {
+                s_rpm_ref_slew = RPM_MIN_X10;
+            }
+            fe_tgt = s_fe_cmd;
+            s.mode = 4U;
+        } else {
+            int32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 12 : 3;
+            fe_tgt = s_fe_cmd + step;
+            if (fe_tgt > fe_ff) { fe_tgt = fe_ff; }
+            if (fe_tgt < (int32_t)FE_MIN_X10) { fe_tgt = (int32_t)FE_MIN_X10; }
+        }
+    } else {
+        int32_t trim_lim = (rpm_ref_abs < 4000) ? TRIM_MAX_LS : TRIM_MAX;
+        err = rpm_ref_abs - rpm_meas;
+        if (iabs32(err) < ERR_DEAD_X10) {
+            err = 0;
+            s_pi_i = (s_pi_i * 7) / 8;
+        } else {
+            s_pi_i += err;
+        }
+        if (s_pi_i > SP_I_LIM) { s_pi_i = SP_I_LIM; }
+        if (s_pi_i < -SP_I_LIM) { s_pi_i = -SP_I_LIM; }
+        trim = (err * SP_KP_NUM) / SP_KP_DEN + (s_pi_i * SP_KI_NUM) / SP_KI_DEN;
+        if (trim > trim_lim) { trim = trim_lim; }
+        if (trim < -trim_lim) { trim = -trim_lim; }
+        fe_tgt = fe_ff + trim;
+        s.mode = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 3U : 2U;
+        {
+            int32_t fe_meas = rpm_to_fe_x10(rpm_meas);
+            int32_t lead = MAX_LEAD_X10;
+            int32_t fe_cap;
+            if (rpm_meas < 4000) { lead = MAX_LEAD_LS_X10; }
+            else if (rpm_meas > 9000) { lead = MAX_LEAD_HS_X10; }
+            fe_cap = fe_meas + lead;
+            if (fe_tgt > fe_cap) {
+                fe_tgt = fe_cap;
+                if (err > 0) { s_pi_i -= err; }
+            }
+        }
+        if ((rpm_ref_abs > 2500) && (rpm_meas < (rpm_ref_abs * 70) / 100)) {
+            if (s_slip_cnt < 50U) { s_slip_cnt++; }
+            if (s_slip_cnt >= 10U) {
+                fe_tgt = rpm_to_fe_x10(rpm_meas) + 60;
+                s_fe_cmd = fe_tgt;
+                s_pi_i /= 4;
+                s.mode = 4U;
+            }
+        } else {
+            s_slip_cnt = 0U;
+        }
+    }
+
+    if (fe_tgt < (int32_t)FE_MIN_X10) { fe_tgt = (int32_t)FE_MIN_X10; }
+    if (fe_tgt > (int32_t)FE_MAX_X10) { fe_tgt = (int32_t)FE_MAX_X10; }
+    slew_fe_amp(fe_tgt);
+}
+
+static void loop_speed(void)
+{
+    int32_t rpm_meas;
+    int32_t rpm_ref;
 
     {
         int32_t up = 40, dn = 100;
@@ -242,127 +441,100 @@ void BSP_FOC_SpeedLoop(void)
         }
     }
     rpm_ref = s_rpm_ref_slew;
+    update_rpm_meas();
+    rpm_meas = s_rpm_filt;
+    s_spin_dir = s_dir;
+    run_speed_vf(rpm_ref, rpm_meas);
 
-    now = g_millis;
-    if (s_rpm_ready == 0U) {
-        s_cum_prev = s_enc_cum; s_ms_prev = now; s_rpm_ready = 1U; rpm_meas = 0;
-    } else {
-        uint32_t dt = now - s_ms_prev;
-        uint32_t need = (s_rpm_filt < 4000) ? 100U : 40U;
-        if (dt >= need) {
-            int32_t dc = s_enc_cum - s_cum_prev;
-            int32_t inst = (dc * 600000L) / ((int32_t)dt * 4096L);
-            if (inst > 25000L) { inst = 25000L; }
-            if (inst < -25000L) { inst = -25000L; }
-            /* 低速更重滤波, 减轻 PI 跟着噪声抖 */
-            if (iabs32(inst) < 4000) {
-                s_rpm_filt = (s_rpm_filt * 5 + iabs32(inst)) / 6;
-            } else {
-                s_rpm_filt = (s_rpm_filt * 2 + iabs32(inst)) / 3;
-            }
-            s_cum_prev = s_enc_cum; s_ms_prev = now;
-        }
-        rpm_meas = s_rpm_filt;
-    }
-
-    fe_ff = rpm_to_fe_x10(rpm_ref);
-
-    if (s_enc_ok == 0U) {
-        s_pi_i = 0; fe_tgt = fe_ff; s.mode = 1U;
-    } else if (rpm_meas < 200) {
-        s_pi_i = 0; s.mode = 1U;
-        if (s_fe_cmd > 400 && rpm_meas < 80) {
-            s_fe_cmd = (int32_t)FE_MIN_X10 + 20;
-            s_rpm_ref_slew = RPM_MIN_X10;
-            fe_tgt = s_fe_cmd; s.mode = 4U;
-        } else {
-            fe_tgt = s_fe_cmd + 3;
-            if (fe_tgt > fe_ff) { fe_tgt = fe_ff; }
-            if (fe_tgt < (int32_t)FE_MIN_X10) { fe_tgt = (int32_t)FE_MIN_X10; }
-        }
-    } else {
-        int32_t trim_lim = (rpm_ref < 4000) ? TRIM_MAX_LS : TRIM_MAX;
-        err = rpm_ref - rpm_meas;
-        /* 死区: 小误差不累计, 前馈为主 */
-        if (iabs32(err) < ERR_DEAD_X10) {
-            err = 0;
-            s_pi_i = (s_pi_i * 7) / 8;
-        } else {
-            s_pi_i += err;
-        }
-        if (s_pi_i > SP_I_LIM) { s_pi_i = SP_I_LIM; }
-        if (s_pi_i < -SP_I_LIM) { s_pi_i = -SP_I_LIM; }
-        trim = (err * SP_KP_NUM) / SP_KP_DEN + (s_pi_i * SP_KI_NUM) / SP_KI_DEN;
-        if (trim > trim_lim) { trim = trim_lim; }
-        if (trim < -trim_lim) { trim = -trim_lim; }
-        fe_tgt = fe_ff + trim;
-        s.mode = 2U;
-        {
-            int32_t fe_meas = rpm_to_fe_x10(rpm_meas);
-            int32_t lead;
-            if (rpm_meas < 4000) { lead = MAX_LEAD_LS_X10; }
-            else if (rpm_meas > 9000) { lead = MAX_LEAD_HS_X10; }
-            else { lead = MAX_LEAD_X10; }
-            int32_t fe_cap = fe_meas + lead;
-            if (fe_tgt > fe_cap) {
-                fe_tgt = fe_cap;
-                if (err > 0) {
-                    s_pi_i -= err;
-                    if ((rpm_meas < ((rpm_ref * 88) / 100)) &&
-                        (s_rpm_ref_slew > (rpm_meas + 1000))) {
-                        s_rpm_ref_slew = rpm_meas + 1000;
-                    }
-                }
-            }
-        }
-        if ((rpm_ref > 2500) && (rpm_meas < (rpm_ref * 70) / 100)) {
-            if (s_slip_cnt < 50U) { s_slip_cnt++; }
-            if (s_slip_cnt >= 10U) {
-                fe_tgt = rpm_to_fe_x10(rpm_meas) + 60;
-                s_fe_cmd = fe_tgt; s_pi_i /= 4;
-                if (s_rpm_ref_slew > (rpm_meas + 600)) {
-                    s_rpm_ref_slew = rpm_meas + 600;
-                }
-                s.mode = 4U;
-            }
-        } else {
-            s_slip_cnt = 0U;
-        }
-    }
-
-    if (fe_tgt < (int32_t)FE_MIN_X10) { fe_tgt = (int32_t)FE_MIN_X10; }
-    if (fe_tgt > (int32_t)FE_MAX_X10) { fe_tgt = (int32_t)FE_MAX_X10; }
-
-    {
-        int32_t up = 2, dn = 8;
-        if (s_fe_cmd > 1200) { up = 2; }
-        else if (s_fe_cmd < 400) { up = 1; dn = 4; } /* 中低速 fe 更平滑 */
-        if (s_fe_cmd < fe_tgt) {
-            s_fe_cmd += up;
-            if (s_fe_cmd > fe_tgt) { s_fe_cmd = fe_tgt; }
-        } else if (s_fe_cmd > fe_tgt) {
-            s_fe_cmd -= dn;
-            if (s_fe_cmd < fe_tgt) { s_fe_cmd = fe_tgt; }
-        }
-    }
-
-    s_phase_inc_tgt = fe_to_inc((uint32_t)s_fe_cmd);
-    s_amp_tgt = fe_to_amp((uint32_t)s_fe_cmd);
     s.rpm = (float)rpm_meas * 0.1f;
     s.iq_a = (float)rpm_ref * 0.1f;
     s.id_a = (float)s_fe_cmd;
     s.omega_e = (float)s_speed_pm;
 }
 
+static void loop_angle(void)
+{
+    int32_t err;
+    int32_t rpm_cmd;
+    int32_t rpm_meas;
+    int32_t dref;
+    int32_t ref_tgt;
+
+    /* 绝对目标 = 进模式时锁定的圈基址 + 电位器 0..4095 */
+    ref_tgt = s_ang_base + (int32_t)s_angle_ref_raw;
+    dref = ref_tgt - s_angle_ref_slew;
+    if (dref > ANG_REF_SLEW) { dref = ANG_REF_SLEW; }
+    if (dref < -ANG_REF_SLEW) { dref = -ANG_REF_SLEW; }
+    s_angle_ref_slew += dref;
+
+    update_rpm_meas();
+    rpm_meas = s_rpm_filt;
+
+    if (s_enc_ok == 0U) {
+        s_spin_dir = s_dir;
+        run_speed_vf(RPM_MIN_X10, rpm_meas);
+        s.mode = 1U;
+        s.iq_a = (float)s_angle_ref_raw * (360.0f / 4096.0f);
+        s.omega_e = 0.0f;
+        s.id_a = (float)s_amp_tgt;
+        s.rpm = (float)rpm_meas * 0.1f;
+        return;
+    }
+
+    /* 绝对误差 (不取模): 转过 ±360° 仍能回到目标 */
+    err = s_angle_ref_slew - s_enc_cum;
+
+    if (iabs32(err) <= ANG_DEAD_RAW) {
+        /* 到位: 停频, 小幅保持 */
+        s_pi_i = 0;
+        s_fe_cmd = 0;
+        s_phase_inc_tgt = 0U;
+        s_amp_tgt = ANG_HOLD_AMP;
+        s_spin_dir = s_dir;
+        s.mode = 3U;
+    } else {
+        rpm_cmd = (err * ANG_KP_NUM) / ANG_KP_DEN;
+        if (rpm_cmd > ANG_RPM_MAX_X10) { rpm_cmd = ANG_RPM_MAX_X10; }
+        if (rpm_cmd < -ANG_RPM_MAX_X10) { rpm_cmd = -ANG_RPM_MAX_X10; }
+        /* 本板: 相位正转时 AS5600 cum 递减, 故误差符号取反驱动 */
+        if (rpm_cmd > 0) {
+            s_spin_dir = -1;
+            run_speed_vf(rpm_cmd, rpm_meas);
+        } else {
+            s_spin_dir = 1;
+            run_speed_vf(-rpm_cmd, rpm_meas);
+        }
+        s.mode = 3U;
+    }
+
+    s.rpm = (float)rpm_meas * 0.1f;
+    /* 相对当前圈: pot0→0°, pot4095→~360°; 超圈时 meas 可超出 */
+    s.iq_a = (float)(s_angle_ref_slew - s_ang_base) * (360.0f / 4096.0f);
+    s.omega_e = (float)(s_enc_cum - s_ang_base) * (360.0f / 4096.0f);
+    s.id_a = (float)s_amp_tgt;
+    s.theta = (float)(s_enc_cum - s_ang_base) * (6.2831853f / 4096.0f);
+}
+
+void BSP_FOC_SpeedLoop(void)
+{
+    if (s.running == 0U) { return; }
+    if (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) {
+        loop_angle();
+    } else {
+        loop_speed();
+    }
+}
+
 void BSP_FOC_PwmIrq(void)
 {
-    uint8_t idx; uint16_t amp; uint32_t inc_tgt;
+    uint8_t idx;
+    uint16_t amp;
+    uint32_t inc_tgt;
 
     if (ATIM_GetITStatus(ATIM_STATE_UIF) == RESET) { return; }
     ATIM_ClearITPendingBit(ATIM_STATE_UIF);
     s.isr_cnt++;
 
-    /* 启停只走 main 单击回调, 避免按下时 IRQ 先停、松开又被单击重新启动 */
     if (s.running == 0U) { return; }
 
     amp = s_amp;
@@ -378,18 +550,20 @@ void BSP_FOC_PwmIrq(void)
     inc_tgt = s_phase_inc_tgt;
     if (s_phase_inc < inc_tgt) {
         uint32_t d = inc_tgt - s_phase_inc;
-        s_phase_inc += (d > INC_SLEW_UP) ? INC_SLEW_UP : d;
+        uint32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 12UL : INC_SLEW_UP;
+        s_phase_inc += (d > step) ? step : d;
     } else if (s_phase_inc > inc_tgt) {
         uint32_t d = s_phase_inc - inc_tgt;
-        s_phase_inc -= (d > INC_SLEW_DN) ? INC_SLEW_DN : d;
+        uint32_t step = (s_ctrl_mode == BSP_FOC_CTRL_ANGLE) ? 24UL : INC_SLEW_DN;
+        s_phase_inc -= (d > step) ? step : d;
     }
 
-    if (s_dir >= 0) { s_phase += s_phase_inc; }
+    if (s_spin_dir >= 0) { s_phase += s_phase_inc; }
     else { s_phase -= s_phase_inc; }
 
     idx = (uint8_t)(s_phase >> 16);
     apply_spwm(idx, amp);
-    if ((s.isr_cnt & 127U) == 0U) {
+    if ((s_ctrl_mode != BSP_FOC_CTRL_ANGLE) && ((s.isr_cnt & 127U) == 0U)) {
         s.theta = (float)idx * (6.2831853f / 256.0f);
     }
 }
