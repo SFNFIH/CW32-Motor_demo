@@ -1,0 +1,17 @@
+/build/
+/.cache/
+.cursor/
+__pycache__/
+*.pyc
+compile_commands.json
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.su
+.vscode/
+.idea/
+*.user
+.env
+.env.*

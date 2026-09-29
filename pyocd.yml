@@ -1,0 +1,10 @@
+# Local WHXY DFP lives in cmsis-pack-manager cache (outside this repo):
+#   ~/.local/share/cmsis-pack-manager/WHXY/CW32L012_DFP/1.0.2.pack
+# (pyocd online index has no WHXY — use explicit pack path)
+pack:
+  - /home/tony/.local/share/cmsis-pack-manager/WHXY/CW32L012_DFP/1.0.2.pack
+
+target_override: cw32l012c8
+frequency: 100000
+connect_mode: under-reset
+reset_type: hw
