@@ -95,7 +95,7 @@ g_pfnVectors:
   .word GTIM1_IRQHandler
   .word GTIM2_IRQHandler
   .word GTIM34_IRQHandler
-  .word LPTIM_IRQHandle
+  .word LPTIM_IRQHandler
   .word BTIM1_IRQHandler
   .word BTIM2_IRQHandler
   .word BTIM3_HALLTIM_IRQHandler
@@ -181,8 +181,8 @@ g_pfnVectors:
   .weak GTIM34_IRQHandler
   .thumb_set GTIM34_IRQHandler,Default_Handler
 
-  .weak LPTIM_IRQHandle
-  .thumb_set LPTIM_IRQHandle,Default_Handler
+  .weak LPTIM_IRQHandler
+  .thumb_set LPTIM_IRQHandler,Default_Handler
 
   .weak BTIM1_IRQHandler
   .thumb_set BTIM1_IRQHandler,Default_Handler

@@ -47,8 +47,14 @@ void BSP_UART_Init(void)
 
 void BSP_UART_SendByte(uint8_t ch)
 {
-    while ((CW_UART1->ISR & UARTx_ISR_TXE_Msk) == 0U)
+    uint32_t guard = 100000UL;
+    while (((CW_UART1->ISR & UARTx_ISR_TXE_Msk) == 0U) && (guard > 0U))
     {
+        guard--;
+    }
+    if (guard == 0U)
+    {
+        return;
     }
     CW_UART1->TDR = ch;
 }
@@ -57,6 +63,7 @@ void BSP_UART_Write(const void *buf, uint32_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
     uint32_t i;
+    uint32_t guard;
 
     if ((buf == NULL) || (len == 0U))
     {
@@ -68,9 +75,11 @@ void BSP_UART_Write(const void *buf, uint32_t len)
         BSP_UART_SendByte(p[i]);
     }
 
-    /* 等最后一字节发完, 同 Arduino 一帧发完再发下一帧 */
-    while ((CW_UART1->ISR & UARTx_ISR_TXBUSY_Msk) != 0U)
+    /* 等最后一字节发完; 超时则放弃, 避免主循环永久卡死 */
+    guard = 200000UL;
+    while (((CW_UART1->ISR & UARTx_ISR_TXBUSY_Msk) != 0U) && (guard > 0U))
     {
+        guard--;
     }
 }
 

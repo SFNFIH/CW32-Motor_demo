@@ -19,6 +19,7 @@ extern "C" {
 #define DBG_CMD_START       1U
 #define DBG_CMD_STOP        2U
 #define DBG_CMD_TOGGLE_DIR  3U
+#define DBG_CMD_DETECT      4U  /* 电机自整定 R/L/Flux (需停机) */
 
 typedef struct __attribute__((packed))
 {

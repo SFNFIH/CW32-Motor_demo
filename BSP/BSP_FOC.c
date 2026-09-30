@@ -459,6 +459,11 @@ void BSP_FOC_ToggleDirection(void)
     BSP_FOC_SetDirection((int8_t)(-s_dir));
 }
 
+uint16_t BSP_FOC_GetAmp(void)
+{
+    return s_amp;
+}
+
 void BSP_FOC_OnEncoder(uint16_t raw, uint8_t ok)
 {
     s_enc_raw = raw;
@@ -655,7 +660,13 @@ void BSP_FOC_PwmIrq(void)
     uint16_t amp;
     uint32_t inc_tgt;
 
-    if (ATIM_GetITStatus(ATIM_STATE_UIF) == RESET) { return; }
+    if (ATIM_GetITStatus(ATIM_STATE_UIF) == RESET)
+    {
+        /* 非更新中断: 清掉可能的残余标志, 避免 NVIC 挂起空转 */
+        ATIM_ClearITPendingBit(ATIM_STATE_CC1IF | ATIM_STATE_CC2IF | ATIM_STATE_CC3IF |
+                                ATIM_STATE_COMIF | ATIM_STATE_BIF | ATIM_STATE_TIF);
+        return;
+    }
     ATIM_ClearITPendingBit(ATIM_STATE_UIF);
     s.isr_cnt++;
 
