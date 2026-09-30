@@ -64,6 +64,8 @@ void BSP_FOC_SetDirection(int8_t dir);
 void BSP_FOC_ToggleDirection(void);
 void BSP_FOC_PwmIrq(void);
 const BSP_FOC_State_t *BSP_FOC_GetState(void);
+/** 当前 SPWM 调制幅度 (counts, 用于自整定估计相电压) */
+uint16_t BSP_FOC_GetAmp(void);
 
 #ifdef __cplusplus
 }

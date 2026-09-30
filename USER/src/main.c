@@ -1,6 +1,7 @@
 /**
  * @file    main.c
- * @brief   单击启停; 双击轮换 速度环 → 角度环 → 电流上限(LED闪)
+ * @brief   单击启停; 双击轮换 速度/角度/Imax;
+ *          停机 + 电位器最低时双击 → 电机自整定 (VESC 风格 R/L/Flux)
  */
 #include "main.h"
 #include "BSP_UART.h"
@@ -9,25 +10,30 @@
 #include "BSP_FOC.h"
 #include "BSP_AS5600.h"
 #include "BSP_DebugSnap.h"
+#include "BSP_MotorDetect.h"
 
-#define APP_HCLK_HZ   96000000U
-#define POT_LO        100U
-#define POT_HI        4000U
-#define LED_BLINK_MS  160U
+#define APP_HCLK_HZ     96000000U
+#define POT_LO          100U
+#define POT_HI          4000U
+#define LED_BLINK_MS    160U
+#define DETECT_POT_MAX  250U
+#define DETECT_PWR_LOSS 5.0f
 
 static void SYSCTRL_Configuration(void);
 static void DelayMs(uint32_t ms);
 static uint16_t PotToSpeed(uint16_t adc);
-/** 电位器 ADC → 角度 raw 0..4095 (一圈目标; 闭环用 AS5600 绝对 cum) */
 static uint16_t PotToAngleRaw(uint16_t adc);
 static uint16_t PotToImaxPm(uint16_t adc);
 static void OnClick(void);
 static void OnDoubleClick(void);
 static void UpdateLed(uint8_t motor_on);
+static void RunMotorDetect(void);
 
 static volatile uint8_t s_req_run;
 static volatile uint8_t s_req_mode;
+static volatile uint8_t s_req_detect;
 static uint8_t s_motor_on;
+static uint8_t s_detect_done;
 extern volatile uint32_t g_millis;
 
 void InitTick(uint32_t HclkFreq)
@@ -55,7 +61,6 @@ static uint16_t PotToSpeed(uint16_t adc)
 
 static uint16_t PotToAngleRaw(uint16_t adc)
 {
-    /* 0..4095 → 角度 raw 0..4095 (与 AS5600 一圈对齐); ≥4095 夹到满量程 */
     if (adc >= 4095U)
     {
         return 4095U;
@@ -84,6 +89,16 @@ static void UpdateLed(uint8_t motor_on)
 
     if (motor_on == 0U)
     {
+        if (s_detect_done != 0U)
+        {
+            /* 自整定成功: 慢闪提示 */
+            if ((g_millis - s_blink_ms) >= 400U)
+            {
+                s_blink_ms = g_millis;
+                BSP_LED_Tog();
+            }
+            return;
+        }
         BSP_LED_Off();
         return;
     }
@@ -97,6 +112,57 @@ static void UpdateLed(uint8_t motor_on)
         return;
     }
     BSP_LED_On();
+}
+
+static void RunMotorDetect(void)
+{
+    int rc;
+    uint32_t t;
+
+    if (s_motor_on != 0U)
+    {
+        BSP_FOC_Stop();
+        s_motor_on = 0U;
+    }
+
+    /* 整定耗时长: 屏蔽按键回调, 避免 BTIM1 里置位 req 导致整定后误启停 */
+    BSP_Button_SetClickCallback(0);
+    BSP_Button_SetDoubleClickCallback(0);
+    s_req_run = 0U;
+    s_req_mode = 0U;
+    s_req_detect = 0U;
+
+    /* 快闪表示正在整定 */
+    for (t = 0U; t < 6U; t++)
+    {
+        BSP_LED_Tog();
+        DelayMs(40U);
+    }
+
+    rc = BSP_MotorDetect_RunAll(DETECT_PWR_LOSS);
+    if (rc == BSP_DETECT_OK || BSP_MotorDetect_GetResult()->valid != 0U)
+    {
+        BSP_MotorDetect_Apply();
+        s_detect_done = 1U;
+        BSP_LED_On();
+    }
+    else
+    {
+        s_detect_done = 0U;
+        /* 失败: 快速闪三下 */
+        for (t = 0U; t < 6U; t++)
+        {
+            BSP_LED_Tog();
+            DelayMs(80U);
+        }
+        BSP_LED_Off();
+    }
+
+    s_req_run = 0U;
+    s_req_mode = 0U;
+    s_req_detect = 0U;
+    BSP_Button_SetClickCallback(OnClick);
+    BSP_Button_SetDoubleClickCallback(OnDoubleClick);
 }
 
 int main(void)
@@ -116,6 +182,7 @@ int main(void)
     BSP_Potentiometer_Init();
     BSP_AS5600_Init(APP_HCLK_HZ);
     BSP_FOC_Init();
+    BSP_MotorDetect_Init();
     BSP_DebugSnap_Init();
     g_force_duty = 0U;
     BSP_Button_Init();
@@ -126,6 +193,7 @@ int main(void)
     {
         const BSP_FOC_State_t *st;
         const BSP_AS5600_State_t *as;
+        const BSP_MotorDetect_Result_t *det;
         uint32_t cmd = BSP_DebugSnap_TakeCmd();
 
         if (cmd == DBG_CMD_START)
@@ -143,13 +211,23 @@ int main(void)
         }
         else if (cmd == DBG_CMD_TOGGLE_DIR)
         {
-            /* 调试口复用为模式切换 (不再换向) */
             s_req_mode = 1U;
+        }
+        else if (cmd == DBG_CMD_DETECT)
+        {
+            s_req_detect = 1U;
+        }
+
+        if (s_req_detect != 0U)
+        {
+            s_req_detect = 0U;
+            RunMotorDetect();
         }
 
         if (s_req_run != 0U)
         {
             s_req_run = 0U;
+            s_detect_done = 0U;
             if (s_motor_on != 0U)
             {
                 BSP_FOC_Stop();
@@ -166,7 +244,16 @@ int main(void)
         if (s_req_mode != 0U)
         {
             s_req_mode = 0U;
-            BSP_FOC_ToggleCtrlMode();
+            pot = BSP_Potentiometer_Read();
+            /* 停机 + 电位器拧到最低: 双击触发自整定 */
+            if ((s_motor_on == 0U) && (pot < DETECT_POT_MAX))
+            {
+                s_req_detect = 1U;
+            }
+            else
+            {
+                BSP_FOC_ToggleCtrlMode();
+            }
         }
 
         pot = BSP_Potentiometer_Read();
@@ -221,7 +308,7 @@ int main(void)
         UpdateLed(s_motor_on);
         BSP_DebugSnap_Publish(st, pot, s_motor_on);
 
-        /* VOFA: 电流设定时 id=实测A iq=ImaxA; 否则沿用速度/角度含义 */
+        det = BSP_MotorDetect_GetResult();
         telemetry[0] = (float)st->mode;
         telemetry[1] = st->id_a;
         telemetry[2] = st->iq_a;
@@ -241,8 +328,26 @@ int main(void)
             telemetry[6] = (float)speed;
         }
         telemetry[7] = (float)pot;
-        telemetry[8] = st->i_lim_a;   /* 设定电流 Imax (A) */
-        telemetry[9] = st->i_meas_a;  /* 实时电流 (A) */
+        if ((s_motor_on == 0U) && (det->valid != 0U))
+        {
+            /* 停机且已整定: ch8=Rs ch9=Ls; 另发 flux/kp/enc + LdLq diff */
+            telemetry[8] = det->rs_ohm;
+            telemetry[9] = det->ls_uh;
+            if (det->enc_ok != 0U)
+            {
+                telemetry[3] = det->enc_offset_deg;
+                telemetry[1] = det->enc_ratio;
+                telemetry[2] = (float)det->enc_inverted;
+            }
+            telemetry[5] = det->flux_wb * 1000.0f; /* mWb */
+            telemetry[6] = det->kp;
+            telemetry[4] = det->ld_lq_diff_h * 1.0e6f; /* (Lq-Ld) µH */
+        }
+        else
+        {
+            telemetry[8] = st->i_lim_a;
+            telemetry[9] = st->i_meas_a;
+        }
         BSP_UART_SendJustFloat(telemetry, 10U);
         DelayMs(2U);
     }

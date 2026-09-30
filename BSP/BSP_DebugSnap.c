@@ -4,6 +4,7 @@
 #include "BSP_DebugSnap.h"
 #include "BSP_FOC.h"
 #include "BSP_AS5600.h"
+#include "BSP_MotorDetect.h"
 
 volatile DbgSnap_t g_dbg;
 volatile uint16_t g_force_duty;
@@ -18,6 +19,7 @@ void BSP_DebugSnap_Init(void)
 void BSP_DebugSnap_Publish(const BSP_FOC_State_t *foc, uint16_t pot, uint8_t motor_on)
 {
     const BSP_AS5600_State_t *as = BSP_AS5600_GetState();
+    const BSP_MotorDetect_Result_t *det = BSP_MotorDetect_GetResult();
 
     if (foc == 0)
     {
@@ -25,9 +27,18 @@ void BSP_DebugSnap_Publish(const BSP_FOC_State_t *foc, uint16_t pot, uint8_t mot
     }
     g_dbg.state = foc->mode;
     g_dbg.step = foc->running;
-    g_dbg.bemf = (uint16_t)(int16_t)(foc->iq_a * 1000.0f);
-    g_dbg.mid = (uint16_t)foc->id_a;
-    g_dbg.duty = (uint16_t)(foc->rpm < 0.0f ? -foc->rpm : foc->rpm);
+    if ((det != 0) && (det->valid != 0U) && (motor_on == 0U))
+    {
+        g_dbg.bemf = (uint16_t)(det->rs_ohm * 1000.0f);   /* mΩ */
+        g_dbg.mid = (uint16_t)(det->ls_uh);                /* µH */
+        g_dbg.duty = (uint16_t)(det->flux_wb * 1.0e6f);    /* µWb */
+    }
+    else
+    {
+        g_dbg.bemf = (uint16_t)(int16_t)(foc->iq_a * 1000.0f);
+        g_dbg.mid = (uint16_t)foc->id_a;
+        g_dbg.duty = (uint16_t)(foc->rpm < 0.0f ? -foc->rpm : foc->rpm);
+    }
     g_dbg.pot = pot;
     g_dbg.zc = (uint16_t)(foc->theta * 57.3f);
     g_dbg.miss = (uint16_t)foc->isr_cnt;
