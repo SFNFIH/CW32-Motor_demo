@@ -1,9 +1,9 @@
 # CW32L012 + DengFOC 2208 无刷电机控制
 
 基于 **CW32L012C8**（Cortex-M0+，HSI 96 MHz）的三相无刷电机控制工程。  
-控制路径：**互补 SPWM / 中点注入 SVPWM + 开环 V/f**，AS5600 测速 / 测角，相电流采样做 **Imax 上限**。
+控制路径：**互补 SPWM / 中点注入 SVPWM + 开环 V/f**，AS5600 测速 / 测角，相电流采样做 **Imax 上限**，并移植了 **VESC 风格电机自整定（R / L / Flux）**。
 
-当前分支 **`feature/current-loop`**：在速度环、绝对位置角度环之上，用双击第三态设定电流上限，并叠加到两个外环。
+当前在 `feature/current-loop` 之上增加 `BSP_MotorDetect`：算法对齐 [vedderb/bldc](https://github.com/vedderb/bldc) 的 `mcpwm_foc_measure_resistance` / `measure_inductance` / `measure_flux_linkage_openloop` / `detect_apply_all_foc` 流程，适配本板无 Id/Iq 与 HFI 的硬件。
 
 ---
 
@@ -14,14 +14,16 @@
 | 电机 | DengFOC 2208，7 极对，相电阻约 8 Ω，母线约 12 V |
 | 驱动波形 | ATIM 中心对齐互补 PWM，约 **15 kHz**，带死区；中点注入近似 SVPWM |
 | 速度环 | 电位器 → 约 **15～1350 rpm**（12 V 下可同步上限约 1200 rpm） |
-| 角度环 | 电位器 **0～4095** → **0～360°**；反馈用 AS5600 **`cum_raw` 绝对多圈**，转过整圈仍能回位 |
-| 电流上限 | 电位器设定 **Imax（约 0.12～1.5 A）**，按比例限制调制电压，**叠加**在速度/角度上 |
+| 角度环 | 电位器 **0～4095** → **0～360°**；反馈用 AS5600 **`cum_raw` 绝对多圈** |
+| 电流上限 | 电位器设定 **Imax（约 0.12～1.5 A）**，按比例限制调制电压 |
+| 自整定 | 测 **Rs / Ls / λ**，并按 VESC 公式算电流环 **kp/ki** 与 observer gain |
 | 速度/位置反馈 | AS5600，**硬件 I2C1** |
 | 电流反馈 | 片内 OPA + ADC1（PB0 / PB1） |
+| 母线电压 | PA8 → ADC2 CH5（自整定用） |
 | 通信 | UART1 JustFloat（VOFA+，**10 通道**）；PyOCD 可读 `g_dbg` |
-| 操作 | **单击**启停；**双击**轮换：速度 → 角度 → 电流上限（LED 闪烁） |
+| 操作 | **单击**启停；**双击**轮换速度/角度/Imax；**停机+电位器最低时双击** → 自整定 |
 
-> **说明：** 这不是 `Id/Iq` FOC 电流环，而是 V/f 外环 + 电流上限。`BSP_FOC_ToggleDirection()` 仍保留，默认按键 **不再换向**。  
+> **说明：** 这不是 `Id/Iq` FOC 电流环，而是 V/f 外环 + 电流上限。自整定得到的 kp/ki 供后续电流环使用。  
 > **12 V：** 反电势大约把同步转速顶在 **1200 rpm**。
 
 ---
@@ -32,12 +34,28 @@
 2. 烧录后复位，LED 灭 = 停机。  
 3. **单击**启动（LED 常亮）。  
 4. **速度环：** 电位器调速，建议从低速慢慢升高。  
-5. **双击 → 角度环：** 电位器 0 → 该圈 0°，满量程 → 约 4095 raw。超圈后仍按绝对位置回去。  
-6. **再双击 → 电流上限：** LED **闪烁**。电位器只改 **Imax**，刚才的速度/角度外环继续跑。拧小电位器，设定电流下降、力矩变弱。  
-7. **再双击**回到速度环（LED 常亮），**Imax 记住**，直到下次再进电流设定。  
-8. **单击**停止。
+5. **双击 → 角度环**；**再双击 → 电流上限**（LED 闪烁）；**再双击**回速度环。  
+6. **单击**停止。  
+7. **自整定：** 停机后把电位器拧到**最低**，再**双击**；或 PyOCD 写 `g_dbg.cmd = 4`。电机会注入电流并短时旋转。成功后 LED 慢闪；VOFA 停机时 ch8=`Rs(Ω)`、ch9=`Ls(µH)`。
 
-VOFA+ 请把通道数设为 **10**。看 **通道 8（设定电流）** 和 **通道 9（实时电流）** 是否跟着电位器和负载变化。
+VOFA+ 通道数设为 **10**。
+
+---
+
+## 电机自整定（VESC 移植）
+
+源码：`BSP/BSP_MotorDetect.c`，对照 `vedderb/bldc`：
+
+| VESC | 本工程 | 做法 |
+|------|--------|------|
+| `mcpwm_foc_measure_resistance` | `BSP_MotorDetect_MeasureR` | 锁轴 DC 注入 A/B（C 中点），`R = Van/Ia` |
+| `mcpwm_foc_measure_inductance*` | `BSP_MotorDetect_MeasureL` | 短电压脉冲 + di/dt（本板无 HFI/FFT） |
+| `conf_general_measure_flux_linkage_openloop` | `BSP_MotorDetect_MeasureFlux` | 开环 V/f + AS5600，`λ=(V−IR)/ωe−IL` |
+| `measure_r_l_imax` / `detect_apply_all_foc` | `BSP_MotorDetect_RunAll` | 功耗爬升电流 → R → L → Flux → kp/ki |
+| `conf_general_calc_apply_foc_cc_kp_ki_gain` | 结果 `kp/ki` | `bw=1/(1500µs)`，`kp=L·bw`，`ki=R·bw` |
+
+电感结果乘 **0.9**（与 VESC 一致）。`Ld−Lq` 在无 HFI 时填 0。  
+默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。
 
 ---
 
@@ -59,14 +77,13 @@ VOFA+ 请把通道数设为 **10**。看 **通道 8（设定电流）** 和 **�
 | SCL | PC15 |
 | 地址 | `0x36` |
 
-开漏 + 内部上拉，100 kHz（与 `cw32l012_i2c_master_int` 一致）。
-
 ### 人机、电流与调试
 
 | 功能 | 引脚 |
 |------|------|
 | 按键（低有效，内部上拉） | PB10 |
 | 电位器 ADC | PA9 → ADC2 CH6 |
+| 母线电压 | PA8 → ADC2 CH5 |
 | 电流 A | OPA1 → PB0 → ADC1 CH8 |
 | 电流 B | OPA2 → PB1 → ADC1 CH9 |
 | UART1 TX / RX | PB12 / PB11，115200 |
@@ -80,32 +97,30 @@ VOFA+ 请把通道数设为 **10**。看 **通道 8（设定电流）** 和 **�
 ## 软件架构
 
 ```
-USER/src/main.c          主循环: 电位器、AS5600、三态模式、JustFloat
+USER/src/main.c          主循环: 三态模式、自整定触发、JustFloat
 BSP/BSP_FOC.c            V/f 速度 + 绝对角度 + Imax 电压缩放
+BSP/BSP_MotorDetect.c    VESC 风格 R/L/Flux 自整定
 BSP/BSP_Current.c        A/B 相电流 (OPA + ADC1)
+BSP/BSP_Vbus.c           母线电压
 BSP/BSP_MOTOR.c          ATIM 互补 PWM
 BSP/BSP_AS5600.c         硬件 I2C 磁编（cum_raw 多圈）
 BSP/BSP_Button.c         单击 / 双击
 BSP/BSP_Potentiometer.c  电位器
 BSP/BSP_UART.c           JustFloat
-BSP/BSP_DebugSnap.c      PyOCD g_dbg
+BSP/BSP_DebugSnap.c      PyOCD g_dbg (cmd=4 触发整定)
 Libraries/               CW32 标准外设库
 ```
 
-### 速度环
+### PyOCD 调试命令（`g_dbg.cmd`）
 
-电位器 → 目标转速（斜坡）→ `fe` 前馈 + 小 PI；中低速压幅、限超前，减轻失步。
+| 值 | 含义 |
+|----|------|
+| 1 | 启动 |
+| 2 | 停止 |
+| 3 | 切换控制模式 |
+| 4 | 电机自整定 |
 
-### 角度环
-
-进模式时锁定圈基址，使电位器 0 对准该圈 0°。绝对误差 `目标 − cum` 不取模。到位后 **停频 + 保持电压**（不再注入最低转速，避免发抖）。
-
-### 电流上限（内环叠加）
-
-- 第三态：电位器 → `Imax`，LED 闪烁。  
-- 对速度/角度 **只缩小调制电压、不改频率**；角度到位时保持停频。  
-- `Imax` 缓变，减轻电位器噪声。  
-- 尚无 Park/`Iq` 闭环，通道 9 为相电流绝对值之和的滤波，便于对照设定值。
+停机且已整定时，`g_dbg.bemf`≈Rs(mΩ)，`mid`≈Ls(µH)，`duty`≈Flux(µWb)。
 
 ---
 
@@ -116,82 +131,37 @@ Libraries/               CW32 标准外设库
 - Python3 + **pyOCD**
 - CMSIS Pack：`WHXY/CW32L012_DFP`
 
-```text
-~/.local/share/cmsis-pack-manager/WHXY/CW32L012_DFP/1.0.2.pack
-```
-
 ```bash
 python3 scripts/install_cw32_pack.py
-python3 scripts/install_cw32_pack.py /path/to/WHXY.CW32L012_DFP.1.0.2.pack
-```
-
----
-
-## 编译与烧录
-
-```bash
 cmake --preset Debug
 cmake --build build/Debug -j
 python3 flash_cw32.py build/Debug/cw32l012_blank.elf
 ```
 
-产物：`build/Debug/cw32l012_blank.elf`（同目录 `.hex` / `.bin`）。  
-`pyocd.yml`：目标 `cw32l012c8`，`under-reset`。烧录前请关掉占用串口的软件。
-
 ---
 
-## VOFA+ JustFloat
+## 调试与遥测
 
-UART1 发送 **10** 个 float + 帧尾 `00 00 80 7F`。
+### VOFA+ JustFloat（10 通道）
 
-| 通道 | 速度环 | 角度环 | 电流设定（LED 闪） |
-|------|--------|--------|-------------------|
-| 0 | mode（0 停 / 1 爬升 / 2 速度 / 3 角度 / 4 失步恢复） | 同左 | 同左 |
-| 1 | `fe_x10` | 调制幅度 | 同外环遗留字段 |
-| 2 | 目标转速 (rpm) | 目标角 (°) | 同外环遗留字段 |
-| 3 | 电角度抽样 | 累计角 (rad) | 同外环 |
-| 4 | AS5600 raw | 同左 | 同左 |
-| 5 | 实测转速 (rpm) | 同左 | 同左 |
-| 6 | 电位器 0～1000 | 实测角 (°) | Imax 千分比 |
-| 7 | 电位器 ADC | 同左 | 同左 |
-| **8** | **设定电流 Imax (A)** | 同左 | 拧电位器变化 |
-| **9** | **实时电流 (A)** | 同左 | 同左 |
+| 序号 | 运行时 | 停机且已整定 |
+|------|--------|--------------|
+| 0–7 | mode / 速度角度 / 电位器等 | 同左 |
+| 8 | Imax (A) | **Rs (Ω)** |
+| 9 | Imeas (A) | **Ls (µH)** |
 
-建议在 VOFA 把通道 8、9 命名为 `Iset`、`Imeas`。
+磁链 / kp / ki 见 `BSP_MotorDetect_GetResult()`。
 
-### PyOCD
+### 已知限制
 
-`g_dbg`（`BSP_DebugSnap.h`）：`as_ok`、`as_raw`、`as_cum`、mode 等。  
-`g_force_duty` 非 0 时强制速度给定（角度/电流映射见 `main.c`）。不要用 halt 测转速。
-
----
-
-## 已知限制
-
-- 开环 V/f + 编码器 + **电流上限**，不是 FOC `Id/Iq` 环。  
-- 12 V 机械转速大约 **1.2 krpm** 封顶。  
-- 角度到位有死区（约 6 raw）。  
-- 电流上限有电压下限，避免锁角时电压过低发抖，因此 Imax 拧到很小也可能仍有一点力矩。  
-- `BSP_Sensorless` / `BSP_BEMF` 等历史模块默认未接入。
-
----
-
-## 目录结构
-
-| 路径 | 说明 |
-|------|------|
-| `BSP/` | 板级驱动与控制 |
-| `USER/` | `main`、中断、`SystemInit` |
-| `Libraries/` | CW32 外设库 |
-| `Doc/` | 原理图 |
-| `cmake/` | 工具链 |
-| `scripts/` | pack 安装、调试 |
-| `flash_cw32.py` | pyOCD 烧录 |
-| `cw32l012_flash.ld` | 链接脚本 |
-| `startup_cw32l012x8.s` | 启动文件 |
+- 自整定电感为 **脉冲 di/dt**，不是 VESC HFI，无法分 Ld/Lq。  
+- 磁链依赖 V/f 开环电压估计 + AS5600，精度低于完整 FOC 观测器。  
+- 当前仍是 **开环 V/f + 编码器外环**，不是电流环 FOC。  
+- 母线约 12 V 时机械转速上限约 **1.2 krpm**。
 
 ---
 
 ## License
 
-学习与个人开发用途；CW32 库文件遵循原厂许可。
+本仓库以学习与个人开发为目的；CW32 库文件请遵循原厂许可。  
+VESC/bldc 算法思路来自 Benjamin Vedder 开源固件，移植时保留对应注释便于对照。

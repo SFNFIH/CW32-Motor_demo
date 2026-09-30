@@ -459,6 +459,11 @@ void BSP_FOC_ToggleDirection(void)
     BSP_FOC_SetDirection((int8_t)(-s_dir));
 }
 
+uint16_t BSP_FOC_GetAmp(void)
+{
+    return s_amp;
+}
+
 void BSP_FOC_OnEncoder(uint16_t raw, uint8_t ok)
 {
     s_enc_raw = raw;
