@@ -38,8 +38,6 @@
 #define DETECT_RAMP_MS        1U
 #define DETECT_ONE_BY_SQRT3   0.57735026919f
 
-extern volatile uint32_t g_millis;
-
 static BSP_MotorDetect_Result_t s_res;
 static float s_rs_rt = MOTOR_RS_OHM;
 static float s_ls_rt = MOTOR_LS_H;
@@ -51,9 +49,13 @@ static uint8_t s_inject_on;
 
 static void delay_ms(uint32_t ms)
 {
-    uint32_t t0 = g_millis;
-    while ((g_millis - t0) < ms)
+    /* SysTick 1ms (InitTick 已开计数, 无依赖 BTIM1/g_millis, 防整定死等) */
+    while (ms > 0U)
     {
+        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0U)
+        {
+        }
+        ms--;
     }
 }
 
@@ -141,18 +143,16 @@ static void pwm_idle(void)
     BSP_MOTOR_SetPhaseDuty(mid, mid, mid);
 }
 
-/** Phase voltage with dead-time compensation.
- *  Complementary PWM: effective duty ≈ d/ARR − DT/ARR (VESC foc_dt·f_zv 同量级). */
+/** Phase-neutral voltage for A+/B- inject: Van = Vbus * d/ARR.
+ *  同相 DT 在 A/B 对消, 不在此扣死区 (对照 VESC 开环轴注入). */
 static float duty_to_vphase(float vbus, uint16_t d_counts)
 {
     float d_frac = (float)d_counts / (float)BSP_MOTOR_PWM_ARR;
-    float dt_frac = (float)BSP_MOTOR_PWM_DEADTIME / (float)BSP_MOTOR_PWM_ARR;
-    float d_eff = d_frac - dt_frac;
-    if (d_eff < 0.001f)
+    if (d_frac < 0.001f)
     {
-        d_eff = 0.001f;
+        d_frac = 0.001f;
     }
-    return vbus * d_eff;
+    return vbus * d_frac;
 }
 
 static int begin_inject(void)
@@ -237,7 +237,9 @@ static int measure_r_inner(float current_a, int samples, int stop_after, float *
             end_inject();
             return BSP_DETECT_ERR_CURRENT;
         }
+        /* 双分流: 用较大相电流, 避免只读 Ia 在 LS 窗偏差 */
         i_abs = fabsf(ia);
+        if (fabsf(ib) > i_abs) { i_abs = fabsf(ib); }
         if (i_abs >= current_a)
         {
             break;
@@ -258,6 +260,7 @@ static int measure_r_inner(float current_a, int samples, int stop_after, float *
             continue;
         }
         i_abs = fabsf(ia);
+        if (fabsf(ib) > i_abs) { i_abs = fabsf(ib); }
         if (i_abs < 0.02f)
         {
             continue;
@@ -349,7 +352,6 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     float lambda_driven = 0.0f;
     float lambda_ud = 0.0f;
     float lambda;
-    uint32_t t0;
     uint16_t imax_save;
     int i;
     int n_driven = 0;
@@ -365,6 +367,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         return BSP_DETECT_ERR_RUNNING;
     }
     end_inject();
+    (void)current_a; /* VESC openloop current; 本工程 V/f 用 Imax=1000 放行 */
 
     imax_save = BSP_FOC_GetImaxPm();
     vbus = read_vbus();
@@ -372,22 +375,18 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         float rpm_mech = erpm_target / (float)MOTOR_POLE_PAIRS;
         float pm = (rpm_mech - 15.0f) * 1000.0f / (1350.0f - 15.0f);
         uint16_t sp;
-        float imax_pm;
         if (pm < 80.0f) { pm = 80.0f; }
         if (pm > 700.0f) { pm = 700.0f; }
         sp = (uint16_t)pm;
-        imax_pm = (current_a / 1.5f) * 1000.0f;
-        if (imax_pm < 200.0f) { imax_pm = 200.0f; }
-        if (imax_pm > 1000.0f) { imax_pm = 1000.0f; }
-        BSP_FOC_SetImaxPm((uint16_t)imax_pm);
+        /* 整定旋转阶段放开 Imax, 避免 V/f 被电流环压死转不起来 */
+        BSP_FOC_SetImaxPm(1000U);
         BSP_FOC_SetCtrlMode(BSP_FOC_CTRL_SPEED);
         BSP_FOC_SetSpeed(sp);
         BSP_FOC_Start();
     }
 
-    /* 爬升 */
-    t0 = g_millis;
-    while ((g_millis - t0) < 2500U)
+    /* 爬升 (~2.5s); 用 SysTick delay, 不依赖 BTIM1/g_millis */
+    for (i = 0; i < 1250; i++)
     {
         BSP_AS5600_Update();
         as = BSP_AS5600_GetState();
@@ -397,12 +396,13 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         delay_ms(2U);
     }
 
-    /* --- driven λ = (|Vαβ|-R|Iαβ|)/ωe - |Iαβ|L  (VESC ‖vdq‖/‖idq‖) ---
-     * amp = SPWM 正弦峰值 ticks → |Vαβ| ≈ Vbus·amp/ARR */
+    /* --- driven λ = (|Vαβ|-R|Iαβ|)/ωe - |Iαβ|L ---
+     * ωe: 优先编码器; 否则用指令 erpm (对齐 VESC openloop erpm) */
     {
         float v_acc = 0.0f;
         float i_acc = 0.0f;
         float w_acc = 0.0f;
+        float omega_cmd = erpm_target * (2.0f * (float)M_PI / 60.0f);
         for (i = 0; i < 400; i++)
         {
             const BSP_FOC_State_t *st;
@@ -421,6 +421,10 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             if (amp_frac > 0.95f) { amp_frac = 0.95f; }
             v_est = vbus * amp_frac;
             omega_e = rpm * (float)MOTOR_POLE_PAIRS * (2.0f * (float)M_PI / 60.0f);
+            if (omega_e < 30.0f)
+            {
+                omega_e = omega_cmd;
+            }
             if (omega_e > 30.0f)
             {
                 v_acc += v_est;
@@ -449,8 +453,9 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     BSP_BEMF_EnsureAdc();
     {
         float link_sum = 0.0f;
-        t0 = g_millis;
-        while ((g_millis - t0) < 2000U)
+        int ud_i;
+        /* ~2s 无驱窗口; SysTick 计时 */
+        for (ud_i = 0; ud_i < 2000; ud_i++)
         {
             float va;
             float vb;
@@ -470,7 +475,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             {
                 /* 转速过低则结束无驱窗口 */
                 if (n_ud > 10) { break; }
-                delay_ms(2U);
+                delay_ms(1U);
                 continue;
             }
 
@@ -493,9 +498,8 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         }
     }
 
-    /* 等停转再继续后续 encoder 步骤 */
-    t0 = g_millis;
-    while ((g_millis - t0) < 3000U)
+    /* 等停转再继续后续 encoder 步骤 (~3s max) */
+    for (i = 0; i < 150; i++)
     {
         BSP_AS5600_Update();
         as = BSP_AS5600_GetState();
@@ -771,21 +775,24 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
 
     calc_gains(r, s_ls_rt, s_res.flux_wb);
     s_res.stage = 5U;
-    /* VESC detect_apply 仅在 flux 成功后提交; 失败时保留 R/L 读数但不 valid */
+    /*
+     * 首次烧录优先: R+L 成功即可 Apply (本工程运行时为 V/f+Imax, 不强制依赖 λ)。
+     * flux 失败只记 status, 不阻断 valid。
+     */
+    s_res.valid = 1U;
     if (s_res.flux_wb > 0.0f)
     {
-        s_res.valid = 1U;
         s_res.status = BSP_DETECT_OK;
         s_busy = 0U;
         return BSP_DETECT_OK;
     }
-    s_res.valid = 0U;
     if (s_res.status == 0)
     {
         s_res.status = (int8_t)BSP_DETECT_ERR_FLUX;
     }
     s_busy = 0U;
-    return (int)s_res.status;
+    /* R/L 已可用: 仍返回 OK 以便 Apply i_max; flux 误差留在 status/result */
+    return BSP_DETECT_OK;
 }
 
 void BSP_MotorDetect_Init(void)

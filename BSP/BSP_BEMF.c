@@ -43,7 +43,7 @@ void BSP_BEMF_Init(void)
 
 void BSP_BEMF_EnsureAdc(void)
 {
-    /* 与电流共用同一 ADC1 序列; 确保软件触发、无 ATIM IRQ */
+    /* 切回 FULL 五通道 (电流读会再自动切 FAST) */
     BSP_Current_ReconfigAdc();
 }
 

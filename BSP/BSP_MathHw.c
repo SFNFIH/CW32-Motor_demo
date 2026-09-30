@@ -222,10 +222,15 @@ void BSP_MathHw_CosSin(float angle_rad, float *c, float *s)
 
 float BSP_MathHw_Div(float num, float den)
 {
-    int32_t n;
-    int32_t d;
-    int32_t q;
     float aden;
+    float anum;
+    float n;
+    float d;
+    float sn;
+    float sd;
+    int32_t ni;
+    int32_t di;
+    int32_t q;
 
     aden = (den >= 0.0f) ? den : -den;
     if (aden < MATH_EPS)
@@ -233,21 +238,56 @@ float BSP_MathHw_Div(float num, float den)
         return 0.0f;
     }
 
-    /* Q20 / Q10 → Q10 商 → /1024 */
-    n = (int32_t)(num * 1048576.0f);
-    d = (int32_t)(den * 1024.0f);
-    if (d == 0)
+    /*
+     * EAU 32-bit 有符号除: 先把 |num|,|den| 收到安全区再 Q12/Q4 定点。
+     * 溢出或除零则回退软浮点, 避免 HFI (f·di) 抖动污染 invL。
+     */
+    anum = (num >= 0.0f) ? num : -num;
+    n = num;
+    d = den;
+    sn = 1.0f;
+    sd = 1.0f;
+    while (anum > 200.0f)
     {
-        return 0.0f;
+        n *= 0.5f;
+        anum *= 0.5f;
+        sn *= 0.5f;
+    }
+    while ((anum > MATH_EPS) && (anum < 0.02f))
+    {
+        n *= 2.0f;
+        anum *= 2.0f;
+        sn *= 2.0f;
+    }
+    while (aden > 200.0f)
+    {
+        d *= 0.5f;
+        aden *= 0.5f;
+        sd *= 0.5f;
+    }
+    while ((aden > MATH_EPS) && (aden < 0.02f))
+    {
+        d *= 2.0f;
+        aden *= 2.0f;
+        sd *= 2.0f;
+    }
+
+    ni = (int32_t)(n * 4096.0f); /* Q12 */
+    di = (int32_t)(d * 16.0f);   /* Q4  → 商为 Q8 */
+    if (di == 0)
+    {
+        return num / den;
     }
 
     EAU_SetMode(EAU_MODE_SIGNED_DIV);
-    EAU_StartOperation((uint32_t)n, (uint32_t)d);
+    EAU_StartOperation((uint32_t)ni, (uint32_t)di);
     eau_wait_idle();
-    if (((uint32_t)EAU_GetStatus() & (uint32_t)EAU_STATUS_DIV_ZERO) != 0U)
+    if (((uint32_t)EAU_GetStatus() &
+         ((uint32_t)EAU_STATUS_DIV_ZERO | (uint32_t)EAU_STATUS_OVERFLOW)) != 0U)
     {
-        return 0.0f;
+        return num / den;
     }
     q = (int32_t)EAU_GetQuotient();
-    return (float)q * (1.0f / 1024.0f);
+    /* (n/d) = q/256; 再补偿 sn/sd: true = (n/sn)/(d/sd) = (n/d)*(sd/sn) */
+    return ((float)q * (1.0f / 256.0f)) * (sd / sn);
 }

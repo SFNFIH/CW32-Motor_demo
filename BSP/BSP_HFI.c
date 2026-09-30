@@ -20,6 +20,7 @@
 #include "BSP_Vbus.h"
 #include "BSP_MathHw.h"
 #include "BSP_motor_params.h"
+#include "cw32l012.h"
 
 #include <math.h>
 #include <string.h>
@@ -63,12 +64,15 @@ static const float s_cos2[HFI_N] = {
     -1.000000f, -0.923880f, -0.707107f, -0.382683f, -0.000000f, 0.382683f, 0.707107f, 0.923880f
 };
 
-extern volatile uint32_t g_millis;
-
 static void delay_ms(uint32_t ms)
 {
-    uint32_t t0 = g_millis;
-    while ((g_millis - t0) < ms) { }
+    while (ms > 0U)
+    {
+        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0U)
+        {
+        }
+        ms--;
+    }
 }
 
 static float read_vbus(void)
@@ -210,7 +214,8 @@ static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float
         /* VESC: if (di > 0.01) buffer[ind] = f_zv * di / Vhfi */
         if (di > 0.01f)
         {
-            inv_l[k] = BSP_MathHw_Div(HFI_FZV_HZ * di, v_hfi);
+            /* 直接浮点: 避免 EAU 对大分子 (f·di) 量化/溢出 */
+            inv_l[k] = (HFI_FZV_HZ * di) / v_hfi;
             filled++;
         }
     }
@@ -298,8 +303,8 @@ int BSP_HFI_MeasureInductance(float duty_frac, int sweeps, BSP_HFI_LResult_t *ou
             continue;
         }
 
-        ld = BSP_MathHw_Div(1.0f, offset + amplitude);
-        lq = BSP_MathHw_Div(1.0f, offset - amplitude);
+        ld = 1.0f / (offset + amplitude);
+        lq = 1.0f / (offset - amplitude);
         if (ld < 1.0e-6f || lq < 1.0e-6f || ld > 0.1f || lq > 0.1f)
         {
             delay_ms(5U);
