@@ -1,6 +1,10 @@
 /**
  * @file    BSP_BEMF.c
- * @brief   三相反电势软件采样 + ADC1 与电流通道互斥
+ * @brief   三相反电势软件采样 (PA0/1/2 → ADC1 CH0/1/2)
+ *
+ * 原理图确认与电流 (PB0/1 → CH8/9) 独立引脚、无冲突。
+ * ADC1 由 BSP_Current_ReconfigAdc 配置为 CH0..2+CH8/9 统一扫描;
+ * 本模块直接读 RESULT_0..2, 无需互斥切换。
  */
 #include "BSP_BEMF.h"
 #include "BSP_Current.h"
@@ -12,7 +16,6 @@
 #include <stddef.h>
 
 volatile uint16_t g_bemf_sample[3];
-static uint8_t s_active;
 
 #ifndef BEMF_DIV_GAIN
 #define BEMF_DIV_GAIN   ((100.0f + 5.1f) / 5.1f)
@@ -33,65 +36,20 @@ void BSP_BEMF_Init(void)
     PA01_ANALOG_ENABLE();
     PA02_ANALOG_ENABLE();
 
-    s_active = 0U;
     g_bemf_sample[0] = 0U;
     g_bemf_sample[1] = 0U;
     g_bemf_sample[2] = 0U;
 }
 
-void BSP_BEMF_Enter(void)
+void BSP_BEMF_EnsureAdc(void)
 {
-    ADC_InitTypeDef adc = {0};
-
-    /* 关掉可能的外部触发 / IRQ, 独占 ADC1 */
-    NVIC_DisableIRQ(ADC1_IRQn);
-    ADC_ITConfig(CW_ADC1, ADC_IT_EOS, DISABLE);
-    ADC_ExtTrigCfg(CW_ADC1, ADC_TRIG_ATIMOC4REFC, DISABLE);
-    ADC_ClearITPendingAll(CW_ADC1);
-
-    adc.ADC_ClkDiv = ADC_Clk_Div8;
-    adc.ADC_ConvertMode = ADC_ConvertMode_Once;
-    adc.ADC_SlaveMod = ADC_SlaveMode_Disable;
-    adc.ADC_SQREns = ADC_SqrEns0to2;
-    adc.ADC_IN0.ADC_InputChannel = ADC_InputCH0;
-    adc.ADC_IN0.ADC_SampTime = ADC_SampTime54Clk;
-    adc.ADC_IN1.ADC_InputChannel = ADC_InputCH1;
-    adc.ADC_IN1.ADC_SampTime = ADC_SampTime54Clk;
-    adc.ADC_IN2.ADC_InputChannel = ADC_InputCH2;
-    adc.ADC_IN2.ADC_SampTime = ADC_SampTime54Clk;
-    adc.ADC_IN3 = adc.ADC_IN0;
-    adc.ADC_IN4 = adc.ADC_IN0;
-    adc.ADC_IN5 = adc.ADC_IN0;
-    adc.ADC_IN6 = adc.ADC_IN0;
-    adc.ADC_IN7 = adc.ADC_IN0;
-    ADC_Init(CW_ADC1, &adc);
-    ADC_Enable(CW_ADC1);
-    s_active = 1U;
-}
-
-void BSP_BEMF_Exit(void)
-{
-    if (s_active == 0U)
-    {
-        return;
-    }
-    s_active = 0U;
+    /* 与电流共用同一 ADC1 序列; 确保软件触发、无 ATIM IRQ */
     BSP_Current_ReconfigAdc();
-}
-
-uint8_t BSP_BEMF_IsActive(void)
-{
-    return s_active;
 }
 
 uint8_t BSP_BEMF_ReadRaw(uint16_t *a, uint16_t *b, uint16_t *c)
 {
-    uint32_t n = 400U;
-
-    if (s_active == 0U)
-    {
-        return 0U;
-    }
+    uint32_t n = 120U;
 
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
     ADC_SoftwareStartConvCmd(CW_ADC1, ENABLE);

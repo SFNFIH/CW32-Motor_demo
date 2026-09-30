@@ -427,10 +427,11 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         }
     }
 
-    /* --- undriven: stop PWM, sample BEMF while coasting (VESC λ = |V|/ω) --- */
+    /* --- undriven: stop PWM, sample BEMF while coasting (VESC λ = |V|/ω) ---
+     * Doc: EA/EB/EC(PA0/1/2) 与电流(PB0/1) 独立, ADC1 同序扫描, 无需互斥 */
     BSP_FOC_Stop();
     delay_ms(5U); /* H-bridge settle */
-    BSP_BEMF_Enter();
+    BSP_BEMF_EnsureAdc();
     {
         float link_sum = 0.0f;
         t0 = g_millis;
@@ -470,7 +471,6 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             }
             delay_ms(1U);
         }
-        BSP_BEMF_Exit();
         s_res.flux_ud_samples = (uint16_t)n_ud;
         if (n_ud > 0)
         {

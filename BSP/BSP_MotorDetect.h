@@ -13,7 +13,8 @@
  *
  * 未移植 (硬件/架构不具备): Hall 表、
  * CAN 多机、EEPROM 持久化、电机温度补偿、旧版 BLDC detect_motor_param。
- * HFI 电感: BSP_HFI.c (SIX_VECTOR + FFT)。无驱磁链: BSP_BEMF Enter/Exit 共用 ADC1。
+ * HFI 电感: BSP_HFI.c (SIX_VECTOR + FFT)。
+ * 无驱磁链: BSP_BEMF 读 PA0/1/2 (与电流 PB0/1 同 ADC1 序列, 原理图无冲突)。
  */
 #ifndef BSP_MOTOR_DETECT_H
 #define BSP_MOTOR_DETECT_H

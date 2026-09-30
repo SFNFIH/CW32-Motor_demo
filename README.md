@@ -66,7 +66,7 @@ VOFA+ 通道数设为 **10**。
 | 相电阻 R | ✅ DC 注入 + **死区电压补偿**；搜索段保持注入 |
 | 电感 L | ✅ **六矢量 HFI**（VESC SIX_VECTOR + FFT），得 L 与 Lq−Ld |
 | 磁链 λ（驱动） | ✅ 开环 V/f + AS5600 |
-| 磁链 λ（无驱 coasting） | ✅ 关 PWM 后 ADC1 切 BEMF（PA0/1/2），`λ=\|Vαβ\|/ωe`；样本>60 优先无驱 |
+| 磁链 λ（无驱 coasting） | ✅ 关 PWM 后读 BEMF（PA0/1/2，与电流同序无冲突），`λ=\|Vαβ\|/ωe`；样本>60 优先无驱 |
 | 编码器 offset/ratio/invert | ✅ 三轴 DC 锁相（简化 `encoder_detect`） |
 | Hall 表检测 | ❌ 无 Hall |
 | kp/ki（tc=1000µs） | ✅ 与 `detect_apply_all_foc` 一致 |
@@ -104,6 +104,7 @@ VOFA+ 通道数设为 **10**。
 | 母线电压 | PA8 → ADC2 CH5 |
 | 电流 A | OPA1 → PB0 → ADC1 CH8 |
 | 电流 B | OPA2 → PB1 → ADC1 CH9 |
+| 相电压 BEMF | MCU_EA/EB/EC → PA0/1/2 → ADC1 CH0/1/2（与电流独立，同序扫描） |
 | UART1 TX / RX | PB12 / PB11，115200 |
 | LED | PC13（低电平点亮） |
 | SWD | SWDIO / SWCLK / 5V / GND |
@@ -119,8 +120,8 @@ USER/src/main.c          主循环: 三态模式、自整定触发、JustFloat
 BSP/BSP_FOC.c            V/f 速度 + 绝对角度 + Imax 电压缩放
 BSP/BSP_MotorDetect.c    VESC 风格 R/L/Flux(驱动+无驱) 自整定
 BSP/BSP_HFI.c            六矢量 HFI 电感
-BSP/BSP_BEMF.c           相电压 (与电流互斥占用 ADC1)
-BSP/BSP_Current.c        A/B 相电流 (OPA + ADC1)
+BSP/BSP_BEMF.c           相电压 PA0/1/2 (与电流同 ADC1 序列, 无冲突)
+BSP/BSP_Current.c        A/B 相电流 (OPA + ADC1 CH8/9)
 BSP/BSP_Vbus.c           母线电压
 BSP/BSP_MOTOR.c          ATIM 互补 PWM
 BSP/BSP_AS5600.c         硬件 I2C 磁编（cum_raw 多圈）

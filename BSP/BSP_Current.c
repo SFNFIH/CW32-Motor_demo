@@ -1,9 +1,12 @@
 /**
  * @file    BSP_Current.c
- * @brief   片内运放独立模式 (外接 20 倍反相), ADC1 读 PB0/PB1
+ * @brief   片内运放独立模式 + ADC1 统一扫描
+ *
+ * 原理图 (Doc P3): BEMF PA0/1/2 与电流 PB0/1 独立引脚, 无硬件冲突。
+ * ADC1 一次序列采 CH0/1/2 (相电压) + CH8/9 (电流), 结果槽:
+ *   RESULT_0..2 = EA/EB/EC, RESULT_3..4 = Ia/Ib
  */
 #include "BSP_Current.h"
-#include "BSP_BEMF.h"
 #include "BSP_motor_params.h"
 #include "cw32l012_adc.h"
 #include "cw32l012_gpio.h"
@@ -14,9 +17,9 @@ static float s_off_a = 2048.0f;
 static float s_off_b = 2048.0f;
 static float s_scale;
 
-static uint8_t adc_pair(uint16_t *a, uint16_t *b)
+static uint8_t adc_start_eos(void)
 {
-    uint32_t n = 80U;
+    uint32_t n = 120U;
 
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
     ADC_SoftwareStartConvCmd(CW_ADC1, ENABLE);
@@ -25,12 +28,18 @@ static uint8_t adc_pair(uint16_t *a, uint16_t *b)
         n--;
     }
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
-    if (n == 0U)
+    return (n != 0U) ? 1U : 0U;
+}
+
+static uint8_t adc_pair(uint16_t *a, uint16_t *b)
+{
+    if (adc_start_eos() == 0U)
     {
         return 0U;
     }
-    *a = ADC_GetConversionValue(CW_ADC1, ADC_RESULT_0);
-    *b = ADC_GetConversionValue(CW_ADC1, ADC_RESULT_1);
+    /* 统一序列: IN3=CH8, IN4=CH9 */
+    *a = ADC_GetConversionValue(CW_ADC1, ADC_RESULT_3);
+    *b = ADC_GetConversionValue(CW_ADC1, ADC_RESULT_4);
     return 1U;
 }
 
@@ -65,11 +74,6 @@ uint8_t BSP_Current_Read(float *ia, float *ib)
     uint16_t b;
 
     if ((ia == 0) || (ib == 0))
-    {
-        return 0U;
-    }
-    /* BEMF 占用 ADC1 时拒绝读电流, 避免通道错乱 */
-    if (BSP_BEMF_IsActive() != 0U)
     {
         return 0U;
     }
@@ -127,22 +131,26 @@ void BSP_Current_ReconfigAdc(void)
     ADC_ExtTrigCfg(CW_ADC1, ADC_TRIG_ATIMOC4REFC, DISABLE);
     ADC_ClearITPendingAll(CW_ADC1);
 
+    /* Doc: EA/EB/EC→PA0/1/2(CH0/1/2), Ia/Ib→PB0/1(CH8/9) — 同序无冲突 */
     ch.ADC_SampTime = ADC_SampTime54Clk;
+    ch.ADC_InputChannel = ADC_InputCH0;
+    adc.ADC_IN0 = ch;
+    ch.ADC_InputChannel = ADC_InputCH1;
+    adc.ADC_IN1 = ch;
+    ch.ADC_InputChannel = ADC_InputCH2;
+    adc.ADC_IN2 = ch;
     ch.ADC_InputChannel = ADC_InputCH8;
+    adc.ADC_IN3 = ch;
+    ch.ADC_InputChannel = ADC_InputCH9;
+    adc.ADC_IN4 = ch;
+    adc.ADC_IN5 = adc.ADC_IN0;
+    adc.ADC_IN6 = adc.ADC_IN0;
+    adc.ADC_IN7 = adc.ADC_IN0;
 
     adc.ADC_ClkDiv = ADC_Clk_Div8;
     adc.ADC_ConvertMode = ADC_ConvertMode_Once;
     adc.ADC_SlaveMod = ADC_SlaveMode_Disable;
-    adc.ADC_SQREns = ADC_SqrEns0to1;
-    adc.ADC_IN0 = ch;
-    ch.ADC_InputChannel = ADC_InputCH9;
-    adc.ADC_IN1 = ch;
-    adc.ADC_IN2 = adc.ADC_IN0;
-    adc.ADC_IN3 = adc.ADC_IN0;
-    adc.ADC_IN4 = adc.ADC_IN0;
-    adc.ADC_IN5 = adc.ADC_IN0;
-    adc.ADC_IN6 = adc.ADC_IN0;
-    adc.ADC_IN7 = adc.ADC_IN0;
+    adc.ADC_SQREns = ADC_SqrEns0to4;
     ADC_Init(CW_ADC1, &adc);
     ADC_Enable(CW_ADC1);
 }
