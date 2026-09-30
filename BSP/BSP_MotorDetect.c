@@ -19,6 +19,7 @@
 #include "BSP_AS5600.h"
 #include "BSP_HFI.h"
 #include "BSP_BEMF.h"
+#include "BSP_MathHw.h"
 #include "BSP_motor_params.h"
 #include "cw32l012.h"
 
@@ -89,7 +90,7 @@ static float i_ab_mag(float ia, float ib)
 {
     float ialpha = ia;
     float ibeta = (ia + 2.0f * ib) * DETECT_ONE_BY_SQRT3;
-    return sqrtf(ialpha * ialpha + ibeta * ibeta);
+    return BSP_MathHw_Hypot(ialpha, ibeta);
 }
 
 /**
@@ -278,7 +279,7 @@ static int measure_r_inner(float current_a, int samples, int stop_after, float *
         end_inject();
         return BSP_DETECT_ERR_CURRENT;
     }
-    *r_ohm = (v_sum / (float)n) / (i_sum / (float)n);
+    *r_ohm = BSP_MathHw_Div(v_sum / (float)n, i_sum / (float)n);
     s_res.i_meas_a = i_sum / (float)n;
     s_res.vbus_v = vbus;
     return BSP_DETECT_OK;
@@ -434,7 +435,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             v_est = v_acc / (float)n_driven;
             i_mag = i_acc / (float)n_driven;
             omega_e = w_acc / (float)n_driven;
-            lambda_driven = (v_est - rs * i_mag) / omega_e - i_mag * ls;
+            lambda_driven = BSP_MathHw_Div(v_est - rs * i_mag, omega_e) - i_mag * ls;
             if (lambda_driven < 0.0f) { lambda_driven = 0.0f; }
             s_res.i_meas_a = i_mag;
         }
@@ -476,10 +477,10 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             if (BSP_BEMF_ReadVolt(&va, &vb, &vc) != 0U)
             {
                 BSP_BEMF_Clarke(va, vb, vc, &valpha, &vbeta);
-                vmag = sqrtf(valpha * valpha + vbeta * vbeta);
+                vmag = BSP_MathHw_Hypot(valpha, vbeta);
                 if (vmag > 0.05f)
                 {
-                    link_sum += vmag / we;
+                    link_sum += BSP_MathHw_Div(vmag, we);
                     n_ud++;
                 }
             }
@@ -611,7 +612,7 @@ int BSP_MotorDetect_MeasureEncoder(float current_a)
         s_res.enc_ok = 0U;
         return BSP_DETECT_ERR_ENCODER;
     }
-    ratio = 120.0f / fabsf(d01);
+    ratio = BSP_MathHw_Div(120.0f, fabsf(d01));
     s_res.enc_ratio = ratio;
     s_res.enc_inverted = (d01 < 0.0f) ? 1U : 0U;
     s_res.enc_offset_deg = deg[0];
@@ -635,12 +636,12 @@ int BSP_MotorDetect_MeasureEncoder(float current_a)
 
 static void calc_gains(float r, float l, float lambda)
 {
-    float bw = 1.0f / (DETECT_TC_US * 1.0e-6f);
+    float bw = BSP_MathHw_Div(1.0f, DETECT_TC_US * 1.0e-6f);
     s_res.kp = l * bw;
     s_res.ki = r * bw;
     if (lambda > 1.0e-6f)
     {
-        s_res.observer_gain = (1.0e-3f / (lambda * lambda)) * 1.0e6f;
+        s_res.observer_gain = BSP_MathHw_Div(1.0e-3f, lambda * lambda) * 1.0e6f;
     }
     else
     {
@@ -731,7 +732,7 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
     s_res.ls_uh = l_uh;
     s_res.ls_h = s_ls_rt;
     s_res.ld_lq_diff_h = ldq * 1.0e-6f;
-    s_res.i_max_a = sqrtf(max_power_loss / r / 1.5f);
+    s_res.i_max_a = BSP_MathHw_Sqrt(BSP_MathHw_Div(max_power_loss, r * 1.5f));
     if (s_res.i_max_a > DETECT_I_ABS_MAX_A)
     {
         s_res.i_max_a = DETECT_I_ABS_MAX_A;
@@ -810,6 +811,7 @@ void BSP_MotorDetect_Init(void)
     s_enc_off_rt = 0.0f;
     s_enc_inv_rt = 0U;
     s_inject_on = 0U;
+    BSP_MathHw_Init();
     BSP_Vbus_Init();
     BSP_BEMF_Init();
 }

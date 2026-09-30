@@ -18,6 +18,7 @@
 #include "BSP_MOTOR.h"
 #include "BSP_Current.h"
 #include "BSP_Vbus.h"
+#include "BSP_MathHw.h"
 #include "BSP_motor_params.h"
 
 #include <math.h>
@@ -209,7 +210,7 @@ static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float
         /* VESC: if (di > 0.01) buffer[ind] = f_zv * di / Vhfi */
         if (di > 0.01f)
         {
-            inv_l[k] = (HFI_FZV_HZ * di) / v_hfi;
+            inv_l[k] = BSP_MathHw_Div(HFI_FZV_HZ * di, v_hfi);
             filled++;
         }
     }
@@ -288,7 +289,7 @@ int BSP_HFI_MeasureInductance(float duty_frac, int sweeps, BSP_HFI_LResult_t *ou
         fft_bin0(inv_l, &real0, &imag0);
         fft_bin2(inv_l, &real2, &imag2);
         offset = real0;
-        amplitude = sqrtf(real2 * real2 + imag2 * imag2) * 2.0f;
+        amplitude = BSP_MathHw_Hypot(real2, imag2) * 2.0f;
 
         if (offset <= amplitude + 1.0f)
         {
@@ -297,8 +298,8 @@ int BSP_HFI_MeasureInductance(float duty_frac, int sweeps, BSP_HFI_LResult_t *ou
             continue;
         }
 
-        ld = 1.0f / (offset + amplitude);
-        lq = 1.0f / (offset - amplitude);
+        ld = BSP_MathHw_Div(1.0f, offset + amplitude);
+        lq = BSP_MathHw_Div(1.0f, offset - amplitude);
         if (ld < 1.0e-6f || lq < 1.0e-6f || ld > 0.1f || lq > 0.1f)
         {
             delay_ms(5U);

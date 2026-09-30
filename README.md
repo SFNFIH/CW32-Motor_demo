@@ -58,6 +58,8 @@ VOFA+ 通道数设为 **10**。
 默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。  
 `Apply` 写入 `i_max` → FOC Imax；`enc_inverted` 只作编码器 polarity 记录，不翻转开环转向。
 
+自整定中的 `hypot` / `sqrt` / `div` / `atan2` 走片上 **CORDIC + EAU**（`BSP_MathHw`，对照官方例程）。
+
 ### 已对齐 / 刻意未移植
 
 | 项目 | 状态 |
@@ -121,6 +123,7 @@ BSP/BSP_FOC.c            V/f 速度 + 绝对角度 + Imax 电压缩放
 BSP/BSP_MotorDetect.c    VESC 风格 R/L/Flux(驱动+无驱) 自整定
 BSP/BSP_HFI.c            六矢量 HFI 电感
 BSP/BSP_BEMF.c           相电压 PA0/1/2 (与电流同 ADC1 序列, 无冲突)
+BSP/BSP_MathHw.c         CORDIC(hypot/atan2/cos/sin) + EAU(div/sqrt)
 BSP/BSP_Current.c        A/B 相电流 (OPA + ADC1 CH8/9)
 BSP/BSP_Vbus.c           母线电压
 BSP/BSP_MOTOR.c          ATIM 互补 PWM
