@@ -3,6 +3,7 @@
  * @brief   片内运放独立模式 (外接 20 倍反相), ADC1 读 PB0/PB1
  */
 #include "BSP_Current.h"
+#include "BSP_BEMF.h"
 #include "BSP_motor_params.h"
 #include "cw32l012_adc.h"
 #include "cw32l012_gpio.h"
@@ -67,6 +68,11 @@ uint8_t BSP_Current_Read(float *ia, float *ib)
     {
         return 0U;
     }
+    /* BEMF 占用 ADC1 时拒绝读电流, 避免通道错乱 */
+    if (BSP_BEMF_IsActive() != 0U)
+    {
+        return 0U;
+    }
     if (adc_pair(&a, &b) == 0U)
     {
         return 0U;
@@ -79,8 +85,6 @@ uint8_t BSP_Current_Read(float *ia, float *ib)
 void BSP_Current_Init(void)
 {
     OPA_InitTypeDef opa = {0};
-    ADC_InitTypeDef adc = {0};
-    ADC_ChannelTypeDef ch;
 
     __SYSCTRL_GPIOA_CLK_ENABLE();
     __SYSCTRL_GPIOB_CLK_ENABLE();
@@ -107,6 +111,22 @@ void BSP_Current_Init(void)
     OPA_Init(CW_OPA2, &opa);
     OPA_Start(CW_OPA2);
 
+    BSP_Current_ReconfigAdc();
+
+    /* I = (adc - offset) * Vref / 4096 / (Rshunt * gain) */
+    s_scale = CUR_VREF_V / (4096.0f * CUR_SHUNT_OHM * CUR_AMP_GAIN);
+}
+
+void BSP_Current_ReconfigAdc(void)
+{
+    ADC_InitTypeDef adc = {0};
+    ADC_ChannelTypeDef ch;
+
+    NVIC_DisableIRQ(ADC1_IRQn);
+    ADC_ITConfig(CW_ADC1, ADC_IT_EOS, DISABLE);
+    ADC_ExtTrigCfg(CW_ADC1, ADC_TRIG_ATIMOC4REFC, DISABLE);
+    ADC_ClearITPendingAll(CW_ADC1);
+
     ch.ADC_SampTime = ADC_SampTime54Clk;
     ch.ADC_InputChannel = ADC_InputCH8;
 
@@ -125,7 +145,4 @@ void BSP_Current_Init(void)
     adc.ADC_IN7 = adc.ADC_IN0;
     ADC_Init(CW_ADC1, &adc);
     ADC_Enable(CW_ADC1);
-
-    /* I = (offset - adc) * Vref / 4096 / (Rshunt * gain) */
-    s_scale = CUR_VREF_V / (4096.0f * CUR_SHUNT_OHM * CUR_AMP_GAIN);
 }

@@ -18,6 +18,7 @@
 #include "BSP_FOC.h"
 #include "BSP_AS5600.h"
 #include "BSP_HFI.h"
+#include "BSP_BEMF.h"
 #include "BSP_motor_params.h"
 #include "cw32l012.h"
 
@@ -334,9 +335,13 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     float i_mag;
     float rpm;
     float omega_e;
+    float lambda_driven = 0.0f;
+    float lambda_ud = 0.0f;
     float lambda;
     uint32_t t0;
     int i;
+    int n_driven = 0;
+    int n_ud = 0;
     const BSP_AS5600_State_t *as;
 
     if ((flux_wb == 0) || (rs <= 0.0f) || (ls <= 0.0f) || (erpm_target < 500.0f))
@@ -367,7 +372,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         BSP_FOC_Start();
     }
 
-    /* 对齐 VESC: 爬升后采样. erpm_per_sec≈1800 → 约 2s 量级 */
+    /* 爬升 */
     t0 = g_millis;
     while ((g_millis - t0) < 2500U)
     {
@@ -379,11 +384,11 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         delay_ms(2U);
     }
 
+    /* --- driven λ = (|V|-R|I|)/ωe - |I|L --- */
     {
         float v_acc = 0.0f;
         float i_acc = 0.0f;
         float w_acc = 0.0f;
-        int n = 0;
         for (i = 0; i < 400; i++)
         {
             const BSP_FOC_State_t *st;
@@ -407,42 +412,109 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
                 v_acc += v_est;
                 i_acc += i_mag;
                 w_acc += omega_e;
-                n++;
+                n_driven++;
             }
             delay_ms(2U);
         }
-
-        /* 关断后等待停转 (VESC wait_motor_stop / undriven 段前) */
-        BSP_FOC_Stop();
-        t0 = g_millis;
-        while ((g_millis - t0) < 3000U)
+        if (n_driven >= 50)
         {
+            v_est = v_acc / (float)n_driven;
+            i_mag = i_acc / (float)n_driven;
+            omega_e = w_acc / (float)n_driven;
+            lambda_driven = (v_est - rs * i_mag) / omega_e - i_mag * ls;
+            if (lambda_driven < 0.0f) { lambda_driven = 0.0f; }
+            s_res.i_meas_a = i_mag;
+        }
+    }
+
+    /* --- undriven: stop PWM, sample BEMF while coasting (VESC λ = |V|/ω) --- */
+    BSP_FOC_Stop();
+    delay_ms(5U); /* H-bridge settle */
+    BSP_BEMF_Enter();
+    {
+        float link_sum = 0.0f;
+        t0 = g_millis;
+        while ((g_millis - t0) < 2000U)
+        {
+            float va;
+            float vb;
+            float vc;
+            float valpha;
+            float vbeta;
+            float vmag;
+            float rpm_now;
+            float we;
+
             BSP_AS5600_Update();
             as = BSP_AS5600_GetState();
-            if (fabsf((float)as->rpm_x10) < 300.0f)
-            {
-                break;
-            }
-            delay_ms(20U);
-        }
-        delay_ms(200U);
+            rpm_now = fabsf((float)as->rpm_x10) * 0.1f;
+            we = rpm_now * (float)MOTOR_POLE_PAIRS * (2.0f * (float)M_PI / 60.0f);
 
-        if (n < 50)
-        {
-            return BSP_DETECT_ERR_FLUX;
+            if (we < 25.0f)
+            {
+                /* 转速过低则结束无驱窗口 */
+                if (n_ud > 10) { break; }
+                delay_ms(2U);
+                continue;
+            }
+
+            if (BSP_BEMF_ReadVolt(&va, &vb, &vc) != 0U)
+            {
+                BSP_BEMF_Clarke(va, vb, vc, &valpha, &vbeta);
+                vmag = sqrtf(valpha * valpha + vbeta * vbeta);
+                if (vmag > 0.05f)
+                {
+                    link_sum += vmag / we;
+                    n_ud++;
+                }
+            }
+            delay_ms(1U);
         }
-        v_est = v_acc / (float)n;
-        i_mag = i_acc / (float)n;
-        omega_e = w_acc / (float)n;
-        lambda = (v_est - rs * i_mag) / omega_e - i_mag * ls;
-        if (lambda < 1.0e-5f)
+        BSP_BEMF_Exit();
+        s_res.flux_ud_samples = (uint16_t)n_ud;
+        if (n_ud > 0)
         {
-            return BSP_DETECT_ERR_FLUX;
+            lambda_ud = link_sum / (float)n_ud;
         }
-        *flux_wb = lambda;
-        s_res.i_meas_a = i_mag;
-        s_res.vbus_v = vbus;
     }
+
+    /* 等停转再继续后续 encoder 步骤 */
+    t0 = g_millis;
+    while ((g_millis - t0) < 3000U)
+    {
+        BSP_AS5600_Update();
+        as = BSP_AS5600_GetState();
+        if (fabsf((float)as->rpm_x10) < 300.0f)
+        {
+            break;
+        }
+        delay_ms(20U);
+    }
+    delay_ms(100U);
+
+    s_res.flux_driven_wb = lambda_driven;
+    s_res.flux_undriven_wb = lambda_ud;
+    s_res.vbus_v = vbus;
+
+    /* VESC: undriven_samples > 60 → 采用无驱 */
+    if (n_ud > 60 && lambda_ud > 1.0e-5f)
+    {
+        lambda = lambda_ud;
+    }
+    else if (lambda_driven > 1.0e-5f)
+    {
+        lambda = lambda_driven;
+    }
+    else if (lambda_ud > 1.0e-5f)
+    {
+        lambda = lambda_ud;
+    }
+    else
+    {
+        return BSP_DETECT_ERR_FLUX;
+    }
+
+    *flux_wb = lambda;
     return BSP_DETECT_OK;
 }
 
@@ -700,6 +772,9 @@ void BSP_MotorDetect_Init(void)
     s_res.ls_uh = MOTOR_LS_H * 1.0e6f;
     s_res.ld_lq_diff_h = 0.0f;
     s_res.flux_wb = 0.0f;
+    s_res.flux_driven_wb = 0.0f;
+    s_res.flux_undriven_wb = 0.0f;
+    s_res.flux_ud_samples = 0U;
     s_res.valid = 0U;
     s_res.status = 0;
     s_res.stage = 0U;
@@ -714,6 +789,7 @@ void BSP_MotorDetect_Init(void)
     s_enc_inv_rt = 0U;
     s_inject_on = 0U;
     BSP_Vbus_Init();
+    BSP_BEMF_Init();
 }
 
 const BSP_MotorDetect_Result_t *BSP_MotorDetect_GetResult(void)

@@ -22,6 +22,10 @@ extern "C" {
 #define CUR_AMP_GAIN              10.0f
 #define CUR_VREF_V                5.0f
 
+/* 相电压 / 母线分压: (100k+5.1k)/5.1k — PA0/1/2 BEMF 与 PA8 Vbus */
+#define BEMF_DIV_GAIN             ((100.0f + 5.1f) / 5.1f)
+#define VBUS_DIV_GAIN             BEMF_DIV_GAIN
+
 /* 自整定默认最大功耗 (W), 用于推算注入电流 / i_max */
 #define MOTOR_DETECT_MAX_LOSS_W   5.0f
 

@@ -14,6 +14,8 @@ extern "C" {
 #endif
 
 void BSP_Current_Init(void);
+/** 重新配置 ADC1 为电流双通道 (BEMF Exit 后调用) */
+void BSP_Current_ReconfigAdc(void);
 /** PWM 关断时调用, 采零电流偏置 */
 void BSP_Current_Calibrate(void);
 /** 返回安培. 0=超时 */

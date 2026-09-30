@@ -11,9 +11,9 @@
  *   measure_r_l_imax / detect_apply_all_foc  → RunAll
  *   conf_general_calc_apply_foc_cc_kp_ki_gain → kp/ki (tc=1000µs, 与 detect_apply 一致)
  *
- * 未移植 (硬件/架构不具备): 无驱 coasting 磁链、Hall 表、
+ * 未移植 (硬件/架构不具备): Hall 表、
  * CAN 多机、EEPROM 持久化、电机温度补偿、旧版 BLDC detect_motor_param。
- * HFI 电感已按 VESC SIX_VECTOR + FFT bin0/bin2 实现 (见 BSP_HFI.c)。
+ * HFI 电感: BSP_HFI.c (SIX_VECTOR + FFT)。无驱磁链: BSP_BEMF Enter/Exit 共用 ADC1。
  */
 #ifndef BSP_MOTOR_DETECT_H
 #define BSP_MOTOR_DETECT_H
@@ -40,7 +40,10 @@ typedef struct
     float ls_h;          /* foc_motor_l */
     float ls_uh;
     float ld_lq_diff_h;  /* foc_motor_ld_lq_diff = Lq-Ld (HFI) */
-    float flux_wb;       /* foc_motor_flux_linkage */
+    float flux_wb;       /* foc_motor_flux_linkage (优先无驱) */
+    float flux_driven_wb;
+    float flux_undriven_wb;
+    uint16_t flux_ud_samples; /* 无驱采样点数; VESC 用 >60 则采纳 */
     float i_meas_a;
     float i_max_a;       /* 按功耗推算, Apply 时写入 FOC Imax */
     float vbus_v;
