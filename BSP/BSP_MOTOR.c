@@ -94,6 +94,21 @@ void BSP_MOTOR_SetPhaseDuty(uint16_t da, uint16_t db, uint16_t dc)
     ATIM_SetCompare3(dc);
 }
 
+void BSP_MOTOR_WaitUpdate(uint32_t n)
+{
+    while (n > 0U)
+    {
+        uint32_t guard = 200000UL;
+        ATIM_ClearITPendingBit(ATIM_STATE_UIF);
+        while ((ATIM_GetITStatus(ATIM_STATE_UIF) == RESET) && (guard > 0U))
+        {
+            guard--;
+        }
+        ATIM_ClearITPendingBit(ATIM_STATE_UIF);
+        n--;
+    }
+}
+
 void BSP_MOTOR_Start(void)
 {
     uint16_t mid = (uint16_t)(BSP_MOTOR_PWM_ARR / 2U);

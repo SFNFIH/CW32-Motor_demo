@@ -52,11 +52,11 @@ VOFA+ 通道数设为 **10**。
 | `mcpwm_foc_measure_inductance*` | `BSP_HFI` 六矢量 HFI + FFT bin0/bin2 → L / (Lq−Ld) |
 | `conf_general_measure_flux_linkage_openloop` | `BSP_MotorDetect_MeasureFlux` | 开环 V/f + AS5600，`λ=(V−IR)/ωe−IL` |
 | `measure_r_l_imax` / `detect_apply_all_foc` | `BSP_MotorDetect_RunAll` | 功耗爬升电流 → R → L → Flux → kp/ki |
-| `conf_general_calc_apply_foc_cc_kp_ki_gain` | 结果 `kp/ki` | `bw=1/(1500µs)`，`kp=L·bw`，`ki=R·bw` |
+| `conf_general_calc_apply_foc_cc_kp_ki_gain` | 结果 `kp/ki` | `bw=1/(1000µs)`（detect_apply），`kp=L·bw`，`ki=R·bw` |
 
 电感结果乘 **0.9**（与 VESC 一致）。HFI 同时给出 **Lq−Ld**。  
 默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。  
-`Apply` 会把 `i_max` 写入 FOC Imax，并根据编码器方向设置 `SetDirection`。
+`Apply` 写入 `i_max` → FOC Imax；`enc_inverted` 只作编码器 polarity 记录，不翻转开环转向。
 
 ### 已对齐 / 刻意未移植
 

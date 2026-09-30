@@ -4,10 +4,10 @@
  *
  * Algorithm (vedderb/bldc motor/mcpwm_foc.c ~4938-4964 + measure_inductance FFT):
  *   For angle k = 0..31:
- *     apply -Vhfi·(cos,sin) for one PWM period, sample iαβ → prev
- *     apply +Vhfi·(cos,sin) for one PWM period, sample iαβ → now
+ *     apply -Vhfi·(cos,sin), wait 2×PWM UPDATE (OC preload), sample iαβ → prev
+ *     apply +Vhfi·(cos,sin), wait 2×PWM UPDATE, sample iαβ → now
  *     di = now_proj - prev_proj
- *     invL[k] = f_zv * di / Vhfi
+ *     if di > 0.01: invL[k] = f_zv * di / Vhfi
  *   FFT bin0 → offset (mean 1/L)
  *   FFT bin2 → 2nd harmonic of 1/L around circle
  *   amp = 2*|bin2|
@@ -19,7 +19,6 @@
 #include "BSP_Current.h"
 #include "BSP_Vbus.h"
 #include "BSP_motor_params.h"
-#include "cw32l012.h"
 
 #include <math.h>
 #include <string.h>
@@ -33,7 +32,6 @@
 #define HFI_SQRT3_BY_2     0.8660254037844386f
 #define HFI_ONE_BY_SQRT3   0.5773502691896257f
 #define HFI_FZV_HZ         ((float)BSP_MOTOR_PWM_HZ)  /* 15 kHz center-aligned period */
-#define HFI_HALF_US        (1000000UL / (BSP_MOTOR_PWM_HZ)) /* one PWM period */
 #define HFI_ERR_PARAM      (-5)
 #define HFI_ERR_CURRENT    (-2)
 #define HFI_ERR_VBUS       (-3)
@@ -65,22 +63,6 @@ static const float s_cos2[HFI_N] = {
 };
 
 extern volatile uint32_t g_millis;
-
-static void delay_us(uint32_t us)
-{
-    uint32_t ticks = (SystemCoreClock / 1000000UL) * us;
-    uint32_t load = SysTick->LOAD + 1U;
-    uint32_t start = SysTick->VAL;
-    uint32_t elapsed = 0U;
-    if (ticks == 0U) { return; }
-    while (elapsed < ticks)
-    {
-        uint32_t now = SysTick->VAL;
-        uint32_t delta = (now <= start) ? (start - now) : (start + load - now);
-        elapsed += delta;
-        start = now;
-    }
-}
 
 static void delay_ms(uint32_t ms)
 {
@@ -180,8 +162,10 @@ static void fft_bin2(const float *x, float *real, float *imag)
 
 /**
  * One 32-point six-vector sweep → invL[] and di[].
- * Timing: each polarity held for ~1 PWM period (HFI_HALF_US), matching
- * VESC is_samp_n toggle at foc_f_zv.
+ *
+ * OC compare 有预装载: CCR 写入后下一 UPDATE 才生效。对齐 VESC ISR 节奏:
+ *   写电压 → 等 2 次 UPDATE (装载 + 完整一周期) → 采样。
+ * invL 仅在 di > 0.01 时写入 (与 mcpwm_foc.c:4946 一致)。
  */
 static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float *i_acc)
 {
@@ -193,6 +177,7 @@ static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float
     float prev;
     float now;
     float di;
+    float di_sum = 0.0f;
     int filled = 0;
 
     *i_acc = 0.0f;
@@ -204,35 +189,29 @@ static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float
         float c = s_cos1[k];
         float s = s_sin1[k];
 
-        /* is_samp_n == 0: apply -V, capture prev after settle */
+        /* is_samp_n == 0: apply -V, sample prev after preload+period */
         set_ab_voltage(-v_hfi * c, -v_hfi * s, vbus);
-        delay_us(HFI_HALF_US);
+        BSP_MOTOR_WaitUpdate(2U);
         if (read_iab(&ia, &ib) == 0U) { return HFI_ERR_CURRENT; }
         clarke(ia, ib, &ialpha, &ibeta);
         prev = c * ialpha + s * ibeta;
 
-        /* is_samp_n == 1: apply +V, capture now, di = now - prev */
+        /* is_samp_n == 1: apply +V, sample now, di = now - prev */
         set_ab_voltage(v_hfi * c, v_hfi * s, vbus);
-        delay_us(HFI_HALF_US);
+        BSP_MOTOR_WaitUpdate(2U);
         if (read_iab(&ia, &ib) == 0U) { return HFI_ERR_CURRENT; }
         clarke(ia, ib, &ialpha, &ibeta);
         now = c * ialpha + s * ibeta;
         di = now - prev;
         di_buf[k] = di;
+        di_sum += di;
 
-        /* VESC only stores when di > 0.01 */
+        /* VESC: if (di > 0.01) buffer[ind] = f_zv * di / Vhfi */
         if (di > 0.01f)
         {
             inv_l[k] = (HFI_FZV_HZ * di) / v_hfi;
             filled++;
         }
-        else if (di < -0.01f)
-        {
-            /* polarity flip: still usable as |1/L| */
-            inv_l[k] = (HFI_FZV_HZ * (-di)) / v_hfi;
-            filled++;
-        }
-        *i_acc += fabsf(di);
     }
 
     pwm_idle();
@@ -240,7 +219,9 @@ static int hfi_sweep(float v_hfi, float vbus, float *inv_l, float *di_buf, float
     {
         return HFI_ERR_CURRENT;
     }
-    *i_acc /= (float)HFI_N;
+    /* VESC i_avg = FFT bin0 of di buffer ≈ mean(di) */
+    *i_acc = di_sum / (float)HFI_N;
+    if (*i_acc < 0.0f) { *i_acc = -*i_acc; }
     return 0;
 }
 

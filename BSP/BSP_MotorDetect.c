@@ -35,8 +35,7 @@
 #define DETECT_DUTY_MAX       0.35f
 #define DETECT_SETTLE_MS      50U
 #define DETECT_RAMP_MS        1U
-/* 死区对有效占空的近似扣除 (timer ticks); 互补中心对齐经验值 */
-#define DETECT_DT_COMP        ((float)BSP_MOTOR_PWM_DEADTIME * 0.5f)
+#define DETECT_ONE_BY_SQRT3   0.57735026919f
 
 extern volatile uint32_t g_millis;
 
@@ -83,6 +82,14 @@ static float ang_diff_deg(float a, float b)
 static float raw_to_deg(uint16_t raw)
 {
     return (float)raw * (360.0f / 4096.0f);
+}
+
+/** |iαβ| from two-shunt Clarke (align VESC ‖idq‖ magnitude use). */
+static float i_ab_mag(float ia, float ib)
+{
+    float ialpha = ia;
+    float ibeta = (ia + 2.0f * ib) * DETECT_ONE_BY_SQRT3;
+    return sqrtf(ialpha * ialpha + ibeta * ibeta);
 }
 
 /**
@@ -133,15 +140,18 @@ static void pwm_idle(void)
     BSP_MOTOR_SetPhaseDuty(mid, mid, mid);
 }
 
-/** Phase voltage with dead-time compensation (VESC FOC voltages include DT comp). */
+/** Phase voltage with dead-time compensation.
+ *  Complementary PWM: effective duty ≈ d/ARR − DT/ARR (VESC foc_dt·f_zv 同量级). */
 static float duty_to_vphase(float vbus, uint16_t d_counts)
 {
-    float d_eff = (float)d_counts - DETECT_DT_COMP;
-    if (d_eff < 1.0f)
+    float d_frac = (float)d_counts / (float)BSP_MOTOR_PWM_ARR;
+    float dt_frac = (float)BSP_MOTOR_PWM_DEADTIME / (float)BSP_MOTOR_PWM_ARR;
+    float d_eff = d_frac - dt_frac;
+    if (d_eff < 0.001f)
     {
-        d_eff = 1.0f;
+        d_eff = 0.001f;
     }
-    return vbus * (d_eff / (float)BSP_MOTOR_PWM_ARR);
+    return vbus * d_eff;
 }
 
 static int begin_inject(void)
@@ -339,6 +349,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     float lambda_ud = 0.0f;
     float lambda;
     uint32_t t0;
+    uint16_t imax_save;
     int i;
     int n_driven = 0;
     int n_ud = 0;
@@ -354,6 +365,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     }
     end_inject();
 
+    imax_save = BSP_FOC_GetImaxPm();
     vbus = read_vbus();
     {
         float rpm_mech = erpm_target / (float)MOTOR_POLE_PAIRS;
@@ -384,7 +396,8 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         delay_ms(2U);
     }
 
-    /* --- driven λ = (|V|-R|I|)/ωe - |I|L --- */
+    /* --- driven λ = (|Vαβ|-R|Iαβ|)/ωe - |Iαβ|L  (VESC ‖vdq‖/‖idq‖) ---
+     * amp = SPWM 正弦峰值 ticks → |Vαβ| ≈ Vbus·amp/ARR */
     {
         float v_acc = 0.0f;
         float i_acc = 0.0f;
@@ -401,7 +414,7 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             st = BSP_FOC_GetState();
             amp = BSP_FOC_GetAmp();
             (void)read_ia_ib(&ia, &ib);
-            i_mag = 0.5f * (fabsf(ia) + fabsf(ib));
+            i_mag = i_ab_mag(ia, ib);
             rpm = fabsf(st->rpm);
             amp_frac = (float)amp / (float)BSP_MOTOR_PWM_ARR;
             if (amp_frac > 0.95f) { amp_frac = 0.95f; }
@@ -427,9 +440,10 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         }
     }
 
-    /* --- undriven: stop PWM, sample BEMF while coasting (VESC λ = |V|/ω) ---
-     * Doc: EA/EB/EC(PA0/1/2) 与电流(PB0/1) 独立, ADC1 同序扫描, 无需互斥 */
+    /* --- undriven: FETs off, λ = |Vαβ|/ωe (VESC optional magnitude path;
+     * default vq/ω needs observer — 本工程无观测器故用幅值) --- */
     BSP_FOC_Stop();
+    BSP_FOC_SetImaxPm(imax_save);
     delay_ms(5U); /* H-bridge settle */
     BSP_BEMF_EnsureAdc();
     {
@@ -756,13 +770,21 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
 
     calc_gains(r, s_ls_rt, s_res.flux_wb);
     s_res.stage = 5U;
-    s_res.valid = 1U;
+    /* VESC detect_apply 仅在 flux 成功后提交; 失败时保留 R/L 读数但不 valid */
+    if (s_res.flux_wb > 0.0f)
+    {
+        s_res.valid = 1U;
+        s_res.status = BSP_DETECT_OK;
+        s_busy = 0U;
+        return BSP_DETECT_OK;
+    }
+    s_res.valid = 0U;
     if (s_res.status == 0)
     {
-        s_res.status = BSP_DETECT_OK;
+        s_res.status = (int8_t)BSP_DETECT_ERR_FLUX;
     }
     s_busy = 0U;
-    return (s_res.flux_wb > 0.0f) ? BSP_DETECT_OK : (int)s_res.status;
+    return (int)s_res.status;
 }
 
 void BSP_MotorDetect_Init(void)
@@ -819,10 +841,8 @@ void BSP_MotorDetect_Apply(void)
         if (pm > 1000.0f) { pm = 1000.0f; }
         BSP_FOC_SetImaxPm((uint16_t)pm);
     }
-    if (s_res.enc_inverted != 0U)
-    {
-        BSP_FOC_SetDirection(-1);
-    }
+    /* enc_inverted 仅表示编码器相对电角度方向 (foc_encoder_inverted),
+     * 不得 SetDirection 翻转电机开环转向 */
 }
 
 float BSP_MotorDetect_GetRs(void) { return s_rs_rt; }
