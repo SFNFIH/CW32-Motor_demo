@@ -125,6 +125,13 @@ static void RunMotorDetect(void)
         s_motor_on = 0U;
     }
 
+    /* 整定耗时长: 屏蔽按键回调, 避免 BTIM1 里置位 req 导致整定后误启停 */
+    BSP_Button_SetClickCallback(0);
+    BSP_Button_SetDoubleClickCallback(0);
+    s_req_run = 0U;
+    s_req_mode = 0U;
+    s_req_detect = 0U;
+
     /* 快闪表示正在整定 */
     for (t = 0U; t < 6U; t++)
     {
@@ -150,6 +157,12 @@ static void RunMotorDetect(void)
         }
         BSP_LED_Off();
     }
+
+    s_req_run = 0U;
+    s_req_mode = 0U;
+    s_req_detect = 0U;
+    BSP_Button_SetClickCallback(OnClick);
+    BSP_Button_SetDoubleClickCallback(OnDoubleClick);
 }
 
 int main(void)

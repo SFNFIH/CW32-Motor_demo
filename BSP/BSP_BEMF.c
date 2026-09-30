@@ -49,7 +49,7 @@ void BSP_BEMF_EnsureAdc(void)
 
 uint8_t BSP_BEMF_ReadRaw(uint16_t *a, uint16_t *b, uint16_t *c)
 {
-    uint32_t n = 120U;
+    uint32_t n = 20000U;
 
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
     ADC_SoftwareStartConvCmd(CW_ADC1, ENABLE);

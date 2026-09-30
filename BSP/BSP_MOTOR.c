@@ -96,9 +96,13 @@ void BSP_MOTOR_SetPhaseDuty(uint16_t da, uint16_t db, uint16_t dc)
 
 void BSP_MOTOR_WaitUpdate(uint32_t n)
 {
+    /* 必须在 PWM IRQ 关闭时调用; 再保险关 UIE, 避免 ISR 抢清 UIF 导致空转超时 */
+    ATIM_ITConfig(ATIM_IT_UIE, DISABLE);
+    NVIC_DisableIRQ(ATIM_IRQn);
+
     while (n > 0U)
     {
-        uint32_t guard = 200000UL;
+        uint32_t guard = 500000UL;
         ATIM_ClearITPendingBit(ATIM_STATE_UIF);
         while ((ATIM_GetITStatus(ATIM_STATE_UIF) == RESET) && (guard > 0U))
         {
@@ -128,7 +132,8 @@ void BSP_MOTOR_EnablePwmIrq(void)
     ATIM_ClearITPendingBit(ATIM_STATE_UIF);
     ATIM_ITConfig(ATIM_IT_UIE, ENABLE);
     NVIC_ClearPendingIRQ(ATIM_IRQn);
-    NVIC_SetPriority(ATIM_IRQn, 0U);
+    /* prio1: 低于 Fault, 高于 BTIM1(2), 避免饿死 1ms 节拍 / g_millis */
+    NVIC_SetPriority(ATIM_IRQn, 1U);
     NVIC_EnableIRQ(ATIM_IRQn);
 }
 

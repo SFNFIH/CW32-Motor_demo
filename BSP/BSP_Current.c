@@ -19,7 +19,8 @@ static float s_scale;
 
 static uint8_t adc_start_eos(void)
 {
-    uint32_t n = 120U;
+    /* 5 通道 × (54samp+conv) @ Div8 ≈ 30µs; 且可能被 ATIM/BTIM 抢占, 留足轮询余量 */
+    uint32_t n = 20000U;
 
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
     ADC_SoftwareStartConvCmd(CW_ADC1, ENABLE);
@@ -126,10 +127,13 @@ void BSP_Current_ReconfigAdc(void)
     ADC_InitTypeDef adc = {0};
     ADC_ChannelTypeDef ch;
 
+    /* 始终关 ADC1 NVIC/EOS IT: 本工程只用软件轮询, 防中断风暴 */
     NVIC_DisableIRQ(ADC1_IRQn);
     ADC_ITConfig(CW_ADC1, ADC_IT_EOS, DISABLE);
+    ADC_ITConfig(CW_ADC1, ADC_IT_EOC, DISABLE);
     ADC_ExtTrigCfg(CW_ADC1, ADC_TRIG_ATIMOC4REFC, DISABLE);
     ADC_ClearITPendingAll(CW_ADC1);
+    NVIC_ClearPendingIRQ(ADC1_IRQn);
 
     /* Doc: EA/EB/EC→PA0/1/2(CH0/1/2), Ia/Ib→PB0/1(CH8/9) — 同序无冲突 */
     ch.ADC_SampTime = ADC_SampTime54Clk;
