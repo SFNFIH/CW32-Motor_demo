@@ -55,7 +55,25 @@ VOFA+ 通道数设为 **10**。
 | `conf_general_calc_apply_foc_cc_kp_ki_gain` | 结果 `kp/ki` | `bw=1/(1500µs)`，`kp=L·bw`，`ki=R·bw` |
 
 电感结果乘 **0.9**（与 VESC 一致）。`Ld−Lq` 在无 HFI 时填 0。  
-默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。
+默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。  
+`Apply` 会把 `i_max` 写入 FOC Imax，并根据编码器方向设置 `SetDirection`。
+
+### 已对齐 / 刻意未移植
+
+| 项目 | 状态 |
+|------|------|
+| DC 电流偏置校准 | ✅ RunAll 开头 `BSP_Current_Calibrate` |
+| 相电阻 R | ✅ DC 注入 + **死区电压补偿**；搜索段保持注入 |
+| 电感 L | ⚠️ 脉冲 di/dt（非 HFI），无 Ld/Lq |
+| 磁链 λ（驱动） | ✅ 开环 V/f + AS5600；公式同 VESC |
+| 磁链 λ（无驱 coasting） | ❌ 需 BEMF/观测器重构 Vq，本板主路径未接 |
+| 编码器 offset/ratio/invert | ✅ 三轴 DC 锁相（简化 `encoder_detect`） |
+| Hall 表检测 | ❌ 无 Hall |
+| kp/ki（tc=1000µs） | ✅ 与 `detect_apply_all_foc` 一致 |
+| 应用 i_max 电流限 | ✅ `Apply` → `BSP_FOC_SetImaxPm` |
+| 电机温度补偿 | ❌ 无温度传感器 |
+| EEPROM / CAN 多机 | ❌ 不适用 |
+| 旧版 BLDC `detect_motor_param` | ❌ 梯形波路径，非 FOC 自整定 |
 
 ---
 
@@ -146,18 +164,14 @@ python3 flash_cw32.py build/Debug/cw32l012_blank.elf
 
 | 序号 | 运行时 | 停机且已整定 |
 |------|--------|--------------|
-| 0–7 | mode / 速度角度 / 电位器等 | 同左 |
+| 0 | mode | mode |
+| 1 | id 遥测 | **enc_ratio**（≈极对数） |
+| 2 | iq 遥测 | **enc_inverted** |
+| 3 | theta | **enc_offset_deg** |
+| 5 | rpm | **flux (mWb)** |
+| 6 | 电位器归一等 | **kp** |
 | 8 | Imax (A) | **Rs (Ω)** |
 | 9 | Imeas (A) | **Ls (µH)** |
-
-磁链 / kp / ki 见 `BSP_MotorDetect_GetResult()`。
-
-### 已知限制
-
-- 自整定电感为 **脉冲 di/dt**，不是 VESC HFI，无法分 Ld/Lq。  
-- 磁链依赖 V/f 开环电压估计 + AS5600，精度低于完整 FOC 观测器。  
-- 当前仍是 **开环 V/f + 编码器外环**，不是电流环 FOC。  
-- 母线约 12 V 时机械转速上限约 **1.2 krpm**。
 
 ---
 

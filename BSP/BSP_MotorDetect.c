@@ -1,14 +1,15 @@
 /**
  * @file    BSP_MotorDetect.c
- * @brief   VESC-style motor parameter detection adapted to CW32 V/f + ABC inject
+ * @brief   VESC-style motor parameter detection for CW32 V/f + ABC inject
  *
- * Algorithm notes (vedderb/bldc):
- * - Resistance: lock electrical axis, inject current, R = |V|/|I|
- *   Here: DC inject on A/B (C at mid) → Van = Vbus*d/ARR, R = Van / Ia
- * - Inductance: VESC uses HFI+FFT; we use short voltage pulses + di/dt
- *   L ≈ V*dt/ΔI with R correction via RL equation; scale 0.9 like VESC
- * - Flux: open-loop spin, λ ≈ (V - I*R)/ωe - I*L (same formula as VESC)
- * - Current PI: kp = L*bw, ki = R*bw, bw = 1/(tc*1e-6), tc=1500 µs
+ * Gaps filled vs first port (对照 vedderb/bldc detect_apply_all_foc):
+ *  - DC current offset cal at RunAll start (mcpwm_foc_dc_cal)
+ *  - Dead-time compensation on resistance voltage
+ *  - kp/ki tc = 1000 µs (detect_apply uses 1000, not flux path's 1500)
+ *  - Apply i_max → FOC Imax (l_current_max)
+ *  - AS5600 encoder offset/ratio/inverted (三轴锁相, 简化 encoder_detect)
+ *  - Wait motor stop after flux before encoder step
+ *  - Keep inject across R search samples (stop_after=false 风格)
  */
 #include "BSP_MotorDetect.h"
 #include "BSP_MOTOR.h"
@@ -22,10 +23,11 @@
 #include <math.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846
+#define M_PI 3.14159265358979323846f
 #endif
 
-#define DETECT_TC_US          1500.0f
+/* detect_apply_all_foc → conf_general_calc_apply_foc_cc_kp_ki_gain(..., 1000) */
+#define DETECT_TC_US          1000.0f
 #define DETECT_IND_SCALE      0.9f
 #define DETECT_I_MIN_A        0.08f
 #define DETECT_I_ABS_MAX_A    1.60f
@@ -33,6 +35,8 @@
 #define DETECT_PULSE_US       200U
 #define DETECT_SETTLE_MS      50U
 #define DETECT_RAMP_MS        1U
+/* 死区对有效占空的近似扣除 (timer ticks); 互补中心对齐经验值 */
+#define DETECT_DT_COMP        ((float)BSP_MOTOR_PWM_DEADTIME * 0.5f)
 
 extern volatile uint32_t g_millis;
 
@@ -40,7 +44,10 @@ static BSP_MotorDetect_Result_t s_res;
 static float s_rs_rt = MOTOR_RS_OHM;
 static float s_ls_rt = MOTOR_LS_H;
 static float s_flux_rt = 0.0f;
+static float s_enc_off_rt;
+static uint8_t s_enc_inv_rt;
 static uint8_t s_busy;
+static uint8_t s_inject_on;
 
 static void delay_ms(uint32_t ms)
 {
@@ -50,7 +57,6 @@ static void delay_ms(uint32_t ms)
     }
 }
 
-/* Busy-wait microseconds using SysTick VAL (HCLK ticks). */
 static void delay_us(uint32_t us)
 {
     uint32_t ticks = (SystemCoreClock / 1000000UL) * us;
@@ -86,22 +92,59 @@ static uint8_t read_ia_ib(float *ia, float *ib)
     return BSP_Current_Read(ia, ib);
 }
 
+static float ang_diff_deg(float a, float b)
+{
+    float d = a - b;
+    while (d > 180.0f) { d -= 360.0f; }
+    while (d < -180.0f) { d += 360.0f; }
+    return d;
+}
+
+static float raw_to_deg(uint16_t raw)
+{
+    return (float)raw * (360.0f / 4096.0f);
+}
+
 /**
- * DC inject along alpha (A vs B), C at mid — FOC phase_override≈0 equivalent.
- * d_counts: half of line-line duty counts; Van = Vbus * d / ARR
+ * axis: 0=A+B- (elec≈0°), 1=B+C- (≈120°), 2=C+A- (≈240°)
+ * Matches FOC phase_override axes for encoder_detect / hall_detect style locking.
  */
-static void set_dc_inject(int16_t d_counts)
+static void set_dc_inject_axis(uint8_t axis, int16_t d_counts)
 {
     const uint16_t mid = (uint16_t)(BSP_MOTOR_PWM_ARR / 2U);
-    int32_t da = (int32_t)mid + (int32_t)d_counts;
-    int32_t db = (int32_t)mid - (int32_t)d_counts;
+    int32_t da = (int32_t)mid;
+    int32_t db = (int32_t)mid;
     int32_t dc = (int32_t)mid;
+    int32_t d = (int32_t)d_counts;
+
+    if (axis == 1U)
+    {
+        db += d;
+        dc -= d;
+    }
+    else if (axis == 2U)
+    {
+        dc += d;
+        da -= d;
+    }
+    else
+    {
+        da += d;
+        db -= d;
+    }
 
     if (da < 0) { da = 0; }
     if (db < 0) { db = 0; }
+    if (dc < 0) { dc = 0; }
     if (da > (int32_t)BSP_MOTOR_PWM_ARR) { da = (int32_t)BSP_MOTOR_PWM_ARR; }
     if (db > (int32_t)BSP_MOTOR_PWM_ARR) { db = (int32_t)BSP_MOTOR_PWM_ARR; }
+    if (dc > (int32_t)BSP_MOTOR_PWM_ARR) { dc = (int32_t)BSP_MOTOR_PWM_ARR; }
     BSP_MOTOR_SetPhaseDuty((uint16_t)da, (uint16_t)db, (uint16_t)dc);
+}
+
+static void set_dc_inject(int16_t d_counts)
+{
+    set_dc_inject_axis(0U, d_counts);
 }
 
 static void pwm_idle(void)
@@ -110,9 +153,15 @@ static void pwm_idle(void)
     BSP_MOTOR_SetPhaseDuty(mid, mid, mid);
 }
 
+/** Phase voltage with dead-time compensation (VESC FOC voltages include DT comp). */
 static float duty_to_vphase(float vbus, uint16_t d_counts)
 {
-    return vbus * ((float)d_counts / (float)BSP_MOTOR_PWM_ARR);
+    float d_eff = (float)d_counts - DETECT_DT_COMP;
+    if (d_eff < 1.0f)
+    {
+        d_eff = 1.0f;
+    }
+    return vbus * (d_eff / (float)BSP_MOTOR_PWM_ARR);
 }
 
 static int begin_inject(void)
@@ -122,6 +171,10 @@ static int begin_inject(void)
     {
         return BSP_DETECT_ERR_RUNNING;
     }
+    if (s_inject_on != 0U)
+    {
+        return BSP_DETECT_OK;
+    }
     BSP_MOTOR_DisablePwmIrq();
     BSP_MOTOR_Stop();
     delay_ms(5U);
@@ -129,21 +182,26 @@ static int begin_inject(void)
     BSP_MOTOR_Start();
     pwm_idle();
     delay_ms(2U);
+    s_inject_on = 1U;
     return BSP_DETECT_OK;
 }
 
 static void end_inject(void)
 {
+    if (s_inject_on == 0U)
+    {
+        return;
+    }
     pwm_idle();
     delay_ms(2U);
     BSP_MOTOR_Stop();
+    s_inject_on = 0U;
 }
 
 /**
- * Measure phase resistance (VESC mcpwm_foc_measure_resistance physics).
- * Ramp voltage until |Ia|≈current_a, then average V/I.
+ * @param stop_after 0=保持注入(供 R 搜索连续采样, 对齐 VESC stop_after=false)
  */
-int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
+static int measure_r_inner(float current_a, int samples, int stop_after, float *r_ohm)
 {
     float vbus;
     float ia;
@@ -179,7 +237,6 @@ int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
         d_max = 20;
     }
 
-    /* Ramp duty until target current (VESC ramps Iq the same way). */
     for (d = 2; d <= d_max; d += 2)
     {
         set_dc_inject((int16_t)d);
@@ -221,10 +278,14 @@ int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
         delay_ms(1U);
     }
 
-    end_inject();
+    if (stop_after != 0)
+    {
+        end_inject();
+    }
 
     if (n < 3)
     {
+        end_inject();
         return BSP_DETECT_ERR_CURRENT;
     }
     *r_ohm = (v_sum / (float)n) / (i_sum / (float)n);
@@ -233,11 +294,11 @@ int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
     return BSP_DETECT_OK;
 }
 
-/**
- * Single short pulse → inductance estimate.
- * From zero: I(t)=(V/R)(1-e^{-tR/L}) ⇒ L = -t R / ln(1 - I R / V)
- * Fallback L = V*t/I when R unknown / near-linear.
- */
+int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
+{
+    return measure_r_inner(current_a, samples, 1, r_ohm);
+}
+
 static float pulse_l_h(float vbus, float rs, int16_t d_counts, uint32_t pulse_us,
                        float *i_peak_out)
 {
@@ -298,7 +359,6 @@ static float pulse_l_h(float vbus, float rs, int16_t d_counts, uint32_t pulse_us
             }
         }
     }
-    /* Linear fallback (short pulse): L = V dt / dI */
     l = (vph * ((float)pulse_us * 1.0e-6f)) / fabsf(di);
     return l;
 }
@@ -336,8 +396,6 @@ int BSP_MotorDetect_MeasureL(float current_goal_a, int samples,
     }
 
     vbus = read_vbus();
-
-    /* Find duty that reaches ~current_goal (VESC duty search 0.02..0.5). */
     d = 8;
     for (d_try = 4; d_try < (int)(0.45f * (float)BSP_MOTOR_PWM_ARR); d_try = (d_try * 3) / 2 + 1)
     {
@@ -379,22 +437,16 @@ int BSP_MotorDetect_MeasureL(float current_goal_a, int samples,
         return BSP_DETECT_ERR_CURRENT;
     }
 
-    /* VESC scales inductance by 0.9 (observer prefers underestimate). */
     *l_uh = (l_sum / (float)ok) * 1.0e6f * DETECT_IND_SCALE;
     if (ld_lq_diff_uh)
     {
-        *ld_lq_diff_uh = 0.0f; /* HFI not available on this board */
+        *ld_lq_diff_uh = 0.0f;
     }
     s_res.i_meas_a = i_sum / (float)ok;
     s_res.vbus_v = vbus;
     return BSP_DETECT_OK;
 }
 
-/**
- * Flux linkage via open-loop V/f spin + AS5600 ω.
- * VESC: λ = (|V| - R|I|)/ωe - |I|*L
- * Here |V| ≈ commanded V/f amplitude as phase voltage estimate.
- */
 int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
                                 float rs, float ls, float *flux_wb)
 {
@@ -419,30 +471,27 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
     {
         return BSP_DETECT_ERR_RUNNING;
     }
+    end_inject();
 
     vbus = read_vbus();
-    /* Map erpm → speed permille roughly: 1350 rpm mech max ≈ 1350*7=9450 erpm */
     {
         float rpm_mech = erpm_target / (float)MOTOR_POLE_PAIRS;
         float pm = (rpm_mech - 15.0f) * 1000.0f / (1350.0f - 15.0f);
         uint16_t sp;
+        float imax_pm;
         if (pm < 80.0f) { pm = 80.0f; }
         if (pm > 700.0f) { pm = 700.0f; }
         sp = (uint16_t)pm;
-
-        /* Limit Imax so voltage stays near current_a * rs scale */
-        {
-            float imax_pm = (current_a / 1.5f) * 1000.0f;
-            if (imax_pm < 200.0f) { imax_pm = 200.0f; }
-            if (imax_pm > 1000.0f) { imax_pm = 1000.0f; }
-            BSP_FOC_SetImaxPm((uint16_t)imax_pm);
-        }
+        imax_pm = (current_a / 1.5f) * 1000.0f;
+        if (imax_pm < 200.0f) { imax_pm = 200.0f; }
+        if (imax_pm > 1000.0f) { imax_pm = 1000.0f; }
+        BSP_FOC_SetImaxPm((uint16_t)imax_pm);
         BSP_FOC_SetCtrlMode(BSP_FOC_CTRL_SPEED);
         BSP_FOC_SetSpeed(sp);
         BSP_FOC_Start();
     }
 
-    /* Ramp / settle ~2.5 s */
+    /* 对齐 VESC: 爬升后采样. erpm_per_sec≈1800 → 约 2s 量级 */
     t0 = g_millis;
     while ((g_millis - t0) < 2500U)
     {
@@ -454,7 +503,6 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         delay_ms(2U);
     }
 
-    /* Average samples — V_phase ≈ Vbus * amp / ARR (SPWM peak vs mid) */
     {
         float v_acc = 0.0f;
         float i_acc = 0.0f;
@@ -487,7 +535,20 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
             }
             delay_ms(2U);
         }
+
+        /* 关断后等待停转 (VESC wait_motor_stop / undriven 段前) */
         BSP_FOC_Stop();
+        t0 = g_millis;
+        while ((g_millis - t0) < 3000U)
+        {
+            BSP_AS5600_Update();
+            as = BSP_AS5600_GetState();
+            if (fabsf((float)as->rpm_x10) < 300.0f)
+            {
+                break;
+            }
+            delay_ms(20U);
+        }
         delay_ms(200U);
 
         if (n < 50)
@@ -497,7 +558,6 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         v_est = v_acc / (float)n;
         i_mag = i_acc / (float)n;
         omega_e = w_acc / (float)n;
-        /* Same formula as conf_general_measure_flux_linkage_openloop */
         lambda = (v_est - rs * i_mag) / omega_e - i_mag * ls;
         if (lambda < 1.0e-5f)
         {
@@ -507,6 +567,107 @@ int BSP_MotorDetect_MeasureFlux(float current_a, float erpm_target,
         s_res.i_meas_a = i_mag;
         s_res.vbus_v = vbus;
     }
+    return BSP_DETECT_OK;
+}
+
+/**
+ * Simplified mcpwm_foc_encoder_detect / hall-style axis lock:
+ * lock elec 0°/120°/240°, read AS5600, derive offset, ratio≈pole_pairs, inverted.
+ */
+int BSP_MotorDetect_MeasureEncoder(float current_a)
+{
+    float vbus;
+    float ia;
+    float ib;
+    float deg[3];
+    int d = 0;
+    int d_max;
+    int axis;
+    int rc;
+    float d01;
+    float d12;
+    float expect_mech;
+    float ratio;
+    const BSP_AS5600_State_t *as;
+
+    if (current_a < DETECT_I_MIN_A)
+    {
+        current_a = DETECT_I_MIN_A;
+    }
+    if (current_a > DETECT_I_ABS_MAX_A)
+    {
+        current_a = DETECT_I_ABS_MAX_A;
+    }
+
+    rc = begin_inject();
+    if (rc != BSP_DETECT_OK)
+    {
+        return rc;
+    }
+
+    vbus = read_vbus();
+    (void)vbus;
+    d_max = (int)(DETECT_DUTY_MAX * (float)BSP_MOTOR_PWM_ARR);
+
+    for (axis = 0; axis < 3; axis++)
+    {
+        for (d = 2; d <= d_max; d += 2)
+        {
+            set_dc_inject_axis((uint8_t)axis, (int16_t)d);
+            delay_ms(DETECT_RAMP_MS);
+            if (read_ia_ib(&ia, &ib) == 0U)
+            {
+                end_inject();
+                return BSP_DETECT_ERR_CURRENT;
+            }
+            if (fabsf(ia) + fabsf(ib) >= current_a)
+            {
+                break;
+            }
+        }
+        delay_ms(150U);
+        BSP_AS5600_Update();
+        as = BSP_AS5600_GetState();
+        if ((as->ok == 0U) || (as->mag_ok == 0U))
+        {
+            end_inject();
+            s_res.enc_ok = 0U;
+            return BSP_DETECT_ERR_ENCODER;
+        }
+        deg[axis] = raw_to_deg(as->raw);
+    }
+
+    end_inject();
+
+    d01 = ang_diff_deg(deg[1], deg[0]);
+    d12 = ang_diff_deg(deg[2], deg[1]);
+    expect_mech = 120.0f / (float)MOTOR_POLE_PAIRS;
+
+    /* ratio = Δθ_elec / Δθ_mech */
+    if (fabsf(d01) < 0.5f)
+    {
+        s_res.enc_ok = 0U;
+        return BSP_DETECT_ERR_ENCODER;
+    }
+    ratio = 120.0f / fabsf(d01);
+    s_res.enc_ratio = ratio;
+    s_res.enc_inverted = (d01 < 0.0f) ? 1U : 0U;
+    s_res.enc_offset_deg = deg[0];
+
+    /* 合理性: ratio 应接近极对数; 两段步进符号一致 */
+    if ((fabsf(ratio - (float)MOTOR_POLE_PAIRS) > 2.5f) ||
+        ((d01 < 0.0f) != (d12 < 0.0f)) ||
+        (fabsf(fabsf(d01) - expect_mech) > expect_mech * 0.85f &&
+         fabsf(fabsf(d01) - expect_mech) > 8.0f))
+    {
+        /* 仍保存读数, 但标记不可靠 */
+        s_res.enc_ok = 0U;
+        return BSP_DETECT_ERR_ENCODER;
+    }
+
+    s_res.enc_ok = 1U;
+    s_enc_off_rt = s_res.enc_offset_deg;
+    s_enc_inv_rt = s_res.enc_inverted;
     return BSP_DETECT_OK;
 }
 
@@ -557,16 +718,24 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
     s_busy = 1U;
     s_res.valid = 0U;
     s_res.status = 0;
+    s_res.enc_ok = 0U;
     s_res.stage = 1U;
 
-    /* --- measure_r_l_imax style current search --- */
+    /* mcpwm_foc_dc_cal: 关 PWM 采电流偏置 */
+    BSP_MOTOR_DisablePwmIrq();
+    BSP_MOTOR_Stop();
+    delay_ms(20U);
+    BSP_Current_Calibrate();
+
+    /* measure_r_l_imax: 连续注入搜索 (stop_after=false) → 终测 stop */
     i_start = DETECT_I_MIN_A;
     i_last = i_start;
     for (i = i_start; i < DETECT_I_ABS_MAX_A; i *= 1.5f)
     {
-        rc = BSP_MotorDetect_MeasureR(i, 5, &r_tmp);
+        rc = measure_r_inner(i, 5, 0, &r_tmp);
         if (rc != BSP_DETECT_OK)
         {
+            end_inject();
             s_res.status = (int8_t)rc;
             s_busy = 0U;
             return rc;
@@ -578,7 +747,7 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
         }
     }
 
-    rc = BSP_MotorDetect_MeasureR(i_last, 80, &r);
+    rc = measure_r_inner(i_last, 80, 1, &r);
     if (rc != BSP_DETECT_OK)
     {
         s_res.status = (int8_t)rc;
@@ -599,6 +768,7 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
     s_ls_rt = l_uh * 1.0e-6f;
     s_res.ls_uh = l_uh;
     s_res.ls_h = s_ls_rt;
+    s_res.ld_lq_diff_h = ldq * 1.0e-6f;
     s_res.i_max_a = sqrtf(max_power_loss / r / 1.5f);
     if (s_res.i_max_a > DETECT_I_ABS_MAX_A)
     {
@@ -606,13 +776,13 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
     }
     s_res.stage = 3U;
 
-    /* Flux: open-loop spin at moderate erpm */
     {
         float i_flux = s_res.i_max_a / 2.5f;
         if (i_flux < DETECT_I_MIN_A)
         {
             i_flux = DETECT_I_MIN_A;
         }
+        /* VESC: erpm_per_sec=1800, duty=0.3; 此处用目标 erpm≈3500 */
         rc = BSP_MotorDetect_MeasureFlux(i_flux, 3500.0f, r, s_ls_rt, &flux);
         if (rc == BSP_DETECT_OK)
         {
@@ -621,14 +791,23 @@ int BSP_MotorDetect_RunAll(float max_power_loss)
         }
         else
         {
-            /* R/L still useful without flux */
             s_res.flux_wb = 0.0f;
             s_res.status = (int8_t)rc;
         }
     }
 
-    calc_gains(r, s_ls_rt, s_res.flux_wb);
     s_res.stage = 4U;
+    {
+        float i_enc = s_res.i_max_a / 3.0f;
+        if (i_enc < DETECT_I_MIN_A)
+        {
+            i_enc = DETECT_I_MIN_A;
+        }
+        (void)BSP_MotorDetect_MeasureEncoder(i_enc);
+    }
+
+    calc_gains(r, s_ls_rt, s_res.flux_wb);
+    s_res.stage = 5U;
     s_res.valid = 1U;
     if (s_res.status == 0)
     {
@@ -643,13 +822,21 @@ void BSP_MotorDetect_Init(void)
     s_res.rs_ohm = MOTOR_RS_OHM;
     s_res.ls_h = MOTOR_LS_H;
     s_res.ls_uh = MOTOR_LS_H * 1.0e6f;
+    s_res.ld_lq_diff_h = 0.0f;
     s_res.flux_wb = 0.0f;
     s_res.valid = 0U;
     s_res.status = 0;
     s_res.stage = 0U;
+    s_res.enc_ok = 0U;
+    s_res.enc_offset_deg = 0.0f;
+    s_res.enc_ratio = (float)MOTOR_POLE_PAIRS;
+    s_res.enc_inverted = 0U;
     s_rs_rt = MOTOR_RS_OHM;
     s_ls_rt = MOTOR_LS_H;
     s_flux_rt = 0.0f;
+    s_enc_off_rt = 0.0f;
+    s_enc_inv_rt = 0U;
+    s_inject_on = 0U;
     BSP_Vbus_Init();
 }
 
@@ -660,25 +847,34 @@ const BSP_MotorDetect_Result_t *BSP_MotorDetect_GetResult(void)
 
 void BSP_MotorDetect_Apply(void)
 {
-    if (s_res.valid != 0U)
+    if (s_res.valid == 0U)
     {
-        s_rs_rt = s_res.rs_ohm;
-        s_ls_rt = s_res.ls_h;
-        s_flux_rt = s_res.flux_wb;
+        return;
+    }
+    s_rs_rt = s_res.rs_ohm;
+    s_ls_rt = s_res.ls_h;
+    s_flux_rt = s_res.flux_wb;
+    if (s_res.enc_ok != 0U)
+    {
+        s_enc_off_rt = s_res.enc_offset_deg;
+        s_enc_inv_rt = s_res.enc_inverted;
+    }
+    /* 对齐 VESC: l_current_max = i_max */
+    if (s_res.i_max_a > 0.05f)
+    {
+        float pm = (s_res.i_max_a / 1.5f) * 1000.0f;
+        if (pm < 120.0f) { pm = 120.0f; }
+        if (pm > 1000.0f) { pm = 1000.0f; }
+        BSP_FOC_SetImaxPm((uint16_t)pm);
+    }
+    if (s_res.enc_inverted != 0U)
+    {
+        BSP_FOC_SetDirection(-1);
     }
 }
 
-float BSP_MotorDetect_GetRs(void)
-{
-    return s_rs_rt;
-}
-
-float BSP_MotorDetect_GetLs(void)
-{
-    return s_ls_rt;
-}
-
-float BSP_MotorDetect_GetFlux(void)
-{
-    return s_flux_rt;
-}
+float BSP_MotorDetect_GetRs(void) { return s_rs_rt; }
+float BSP_MotorDetect_GetLs(void) { return s_ls_rt; }
+float BSP_MotorDetect_GetFlux(void) { return s_flux_rt; }
+float BSP_MotorDetect_GetEncOffsetDeg(void) { return s_enc_off_rt; }
+uint8_t BSP_MotorDetect_GetEncInverted(void) { return s_enc_inv_rt; }
