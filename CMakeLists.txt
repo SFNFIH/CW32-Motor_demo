@@ -47,6 +47,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     BSP/BSP_AS5600.c
     BSP/BSP_DebugSnap.c
     BSP/BSP_MotorDetect.c
+    BSP/BSP_HFI.c
     USER/src/main.c
     USER/src/interrupts_cw32l012.c
     USER/src/system_cw32l012_override.c

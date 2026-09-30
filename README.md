@@ -3,7 +3,7 @@
 基于 **CW32L012C8**（Cortex-M0+，HSI 96 MHz）的三相无刷电机控制工程。  
 控制路径：**互补 SPWM / 中点注入 SVPWM + 开环 V/f**，AS5600 测速 / 测角，相电流采样做 **Imax 上限**，并移植了 **VESC 风格电机自整定（R / L / Flux）**。
 
-当前在 `feature/current-loop` 之上增加 `BSP_MotorDetect`：算法对齐 [vedderb/bldc](https://github.com/vedderb/bldc) 的 `mcpwm_foc_measure_resistance` / `measure_inductance` / `measure_flux_linkage_openloop` / `detect_apply_all_foc` 流程，适配本板无 Id/Iq 与 HFI 的硬件。
+当前在 `feature/current-loop` 之上增加 `BSP_MotorDetect` / `BSP_HFI`：算法对齐 [vedderb/bldc](https://github.com/vedderb/bldc) 的 `mcpwm_foc_measure_resistance` / **六矢量 HFI** `measure_inductance` / `measure_flux_linkage_openloop` / `detect_apply_all_foc`。
 
 ---
 
@@ -49,12 +49,12 @@ VOFA+ 通道数设为 **10**。
 | VESC | 本工程 | 做法 |
 |------|--------|------|
 | `mcpwm_foc_measure_resistance` | `BSP_MotorDetect_MeasureR` | 锁轴 DC 注入 A/B（C 中点），`R = Van/Ia` |
-| `mcpwm_foc_measure_inductance*` | `BSP_MotorDetect_MeasureL` | 短电压脉冲 + di/dt（本板无 HFI/FFT） |
+| `mcpwm_foc_measure_inductance*` | `BSP_HFI` 六矢量 HFI + FFT bin0/bin2 → L / (Lq−Ld) |
 | `conf_general_measure_flux_linkage_openloop` | `BSP_MotorDetect_MeasureFlux` | 开环 V/f + AS5600，`λ=(V−IR)/ωe−IL` |
 | `measure_r_l_imax` / `detect_apply_all_foc` | `BSP_MotorDetect_RunAll` | 功耗爬升电流 → R → L → Flux → kp/ki |
 | `conf_general_calc_apply_foc_cc_kp_ki_gain` | 结果 `kp/ki` | `bw=1/(1500µs)`，`kp=L·bw`，`ki=R·bw` |
 
-电感结果乘 **0.9**（与 VESC 一致）。`Ld−Lq` 在无 HFI 时填 0。  
+电感结果乘 **0.9**（与 VESC 一致）。HFI 同时给出 **Lq−Ld**。  
 默认 `max_power_loss = 5 W`，电流硬限约 **1.6 A**。整定中请保证电机可自由转动。  
 `Apply` 会把 `i_max` 写入 FOC Imax，并根据编码器方向设置 `SetDirection`。
 
@@ -64,7 +64,7 @@ VOFA+ 通道数设为 **10**。
 |------|------|
 | DC 电流偏置校准 | ✅ RunAll 开头 `BSP_Current_Calibrate` |
 | 相电阻 R | ✅ DC 注入 + **死区电压补偿**；搜索段保持注入 |
-| 电感 L | ⚠️ 脉冲 di/dt（非 HFI），无 Ld/Lq |
+| 电感 L | ✅ **六矢量 HFI**（VESC SIX_VECTOR + FFT），得 L 与 Lq−Ld |
 | 磁链 λ（驱动） | ✅ 开环 V/f + AS5600；公式同 VESC |
 | 磁链 λ（无驱 coasting） | ❌ 需 BEMF/观测器重构 Vq，本板主路径未接 |
 | 编码器 offset/ratio/invert | ✅ 三轴 DC 锁相（简化 `encoder_detect`） |

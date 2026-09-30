@@ -317,7 +317,7 @@ int main(void)
         telemetry[7] = (float)pot;
         if ((s_motor_on == 0U) && (det->valid != 0U))
         {
-            /* 停机且已整定: ch8=Rs(Ω) ch9=Ls(µH); 磁链见 GetResult */
+            /* 停机且已整定: ch8=Rs ch9=Ls; 另发 flux/kp/enc + LdLq diff */
             telemetry[8] = det->rs_ohm;
             telemetry[9] = det->ls_uh;
             if (det->enc_ok != 0U)
@@ -328,6 +328,7 @@ int main(void)
             }
             telemetry[5] = det->flux_wb * 1000.0f; /* mWb */
             telemetry[6] = det->kp;
+            telemetry[4] = det->ld_lq_diff_h * 1.0e6f; /* (Lq-Ld) µH */
         }
         else
         {

@@ -5,14 +5,15 @@
  * VESC 对照:
  *   mcpwm_foc_dc_cal                         → RunAll 开头电流偏置校准
  *   mcpwm_foc_measure_resistance             → MeasureR (含死区电压补偿)
- *   mcpwm_foc_measure_inductance*            → MeasureL (脉冲 di/dt, 非 HFI)
+ *   mcpwm_foc_measure_inductance*            → MeasureL → BSP_HFI (六矢量 HFI + FFT)
  *   conf_general_measure_flux_linkage_openloop → MeasureFlux
  *   mcpwm_foc_encoder_detect (简化)          → MeasureEncoder (AS5600 三轴锁相)
  *   measure_r_l_imax / detect_apply_all_foc  → RunAll
  *   conf_general_calc_apply_foc_cc_kp_ki_gain → kp/ki (tc=1000µs, 与 detect_apply 一致)
  *
- * 未移植 (硬件/架构不具备): HFI Ld/Lq、无驱 coasting 磁链、Hall 表、
+ * 未移植 (硬件/架构不具备): 无驱 coasting 磁链、Hall 表、
  * CAN 多机、EEPROM 持久化、电机温度补偿、旧版 BLDC detect_motor_param。
+ * HFI 电感已按 VESC SIX_VECTOR + FFT bin0/bin2 实现 (见 BSP_HFI.c)。
  */
 #ifndef BSP_MOTOR_DETECT_H
 #define BSP_MOTOR_DETECT_H
@@ -38,7 +39,7 @@ typedef struct
     float rs_ohm;        /* foc_motor_r */
     float ls_h;          /* foc_motor_l */
     float ls_uh;
-    float ld_lq_diff_h;  /* foc_motor_ld_lq_diff; 无 HFI 时为 0 */
+    float ld_lq_diff_h;  /* foc_motor_ld_lq_diff = Lq-Ld (HFI) */
     float flux_wb;       /* foc_motor_flux_linkage */
     float i_meas_a;
     float i_max_a;       /* 按功耗推算, Apply 时写入 FOC Imax */

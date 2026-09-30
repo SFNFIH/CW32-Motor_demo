@@ -17,6 +17,7 @@
 #include "BSP_Vbus.h"
 #include "BSP_FOC.h"
 #include "BSP_AS5600.h"
+#include "BSP_HFI.h"
 #include "BSP_motor_params.h"
 #include "cw32l012.h"
 
@@ -28,11 +29,9 @@
 
 /* detect_apply_all_foc → conf_general_calc_apply_foc_cc_kp_ki_gain(..., 1000) */
 #define DETECT_TC_US          1000.0f
-#define DETECT_IND_SCALE      0.9f
 #define DETECT_I_MIN_A        0.08f
 #define DETECT_I_ABS_MAX_A    1.60f
 #define DETECT_DUTY_MAX       0.35f
-#define DETECT_PULSE_US       200U
 #define DETECT_SETTLE_MS      50U
 #define DETECT_RAMP_MS        1U
 /* 死区对有效占空的近似扣除 (timer ticks); 互补中心对齐经验值 */
@@ -54,26 +53,6 @@ static void delay_ms(uint32_t ms)
     uint32_t t0 = g_millis;
     while ((g_millis - t0) < ms)
     {
-    }
-}
-
-static void delay_us(uint32_t us)
-{
-    uint32_t ticks = (SystemCoreClock / 1000000UL) * us;
-    uint32_t load = SysTick->LOAD + 1U;
-    uint32_t start = SysTick->VAL;
-    uint32_t elapsed = 0U;
-
-    if (ticks == 0U)
-    {
-        return;
-    }
-    while (elapsed < ticks)
-    {
-        uint32_t now = SysTick->VAL;
-        uint32_t delta = (now <= start) ? (start - now) : (start + load - now);
-        elapsed += delta;
-        start = now;
     }
 }
 
@@ -299,81 +278,11 @@ int BSP_MotorDetect_MeasureR(float current_a, int samples, float *r_ohm)
     return measure_r_inner(current_a, samples, 1, r_ohm);
 }
 
-static float pulse_l_h(float vbus, float rs, int16_t d_counts, uint32_t pulse_us,
-                       float *i_peak_out)
-{
-    float ia0;
-    float ib0;
-    float ia1;
-    float ib1;
-    float i0;
-    float i1;
-    float di;
-    float vph;
-    float l;
-    float x;
-    uint16_t d_abs = (uint16_t)((d_counts >= 0) ? d_counts : (int16_t)(-d_counts));
-
-    pwm_idle();
-    delay_us(400U);
-    if (read_ia_ib(&ia0, &ib0) == 0U)
-    {
-        return -1.0f;
-    }
-    i0 = ia0;
-
-    set_dc_inject(d_counts);
-    delay_us(pulse_us);
-    if (read_ia_ib(&ia1, &ib1) == 0U)
-    {
-        pwm_idle();
-        return -1.0f;
-    }
-    i1 = ia1;
-    pwm_idle();
-
-    di = i1 - i0;
-    if (fabsf(di) < 0.01f)
-    {
-        return -1.0f;
-    }
-    vph = duty_to_vphase(vbus, d_abs);
-    if (vph < 0.05f)
-    {
-        return -1.0f;
-    }
-    if (i_peak_out)
-    {
-        *i_peak_out = fabsf(di);
-    }
-
-    if (rs > 0.05f)
-    {
-        x = (fabsf(di) * rs) / vph;
-        if (x > 0.02f && x < 0.95f)
-        {
-            l = -((float)pulse_us * 1.0e-6f) * rs / logf(1.0f - x);
-            if (l > 1.0e-6f && l < 0.1f)
-            {
-                return l;
-            }
-        }
-    }
-    l = (vph * ((float)pulse_us * 1.0e-6f)) / fabsf(di);
-    return l;
-}
-
 int BSP_MotorDetect_MeasureL(float current_goal_a, int samples,
                              float *l_uh, float *ld_lq_diff_uh)
 {
-    float vbus;
-    float rs = s_rs_rt;
-    float l_sum = 0.0f;
-    float i_sum = 0.0f;
-    int ok = 0;
-    int d;
-    int d_try;
-    int i;
+    BSP_HFI_LResult_t hfi;
+    int sweeps;
     int rc;
 
     if ((l_uh == 0) || (samples < 1))
@@ -389,61 +298,28 @@ int BSP_MotorDetect_MeasureL(float current_goal_a, int samples,
         current_goal_a = DETECT_I_ABS_MAX_A;
     }
 
-    rc = begin_inject();
-    if (rc != BSP_DETECT_OK)
-    {
-        return rc;
-    }
+    /* VESC measure_inductance averages samples/10 full HFI buffers */
+    sweeps = samples / 10;
+    if (sweeps < 4) { sweeps = 4; }
+    if (sweeps > 20) { sweeps = 20; }
 
-    vbus = read_vbus();
-    d = 8;
-    for (d_try = 4; d_try < (int)(0.45f * (float)BSP_MOTOR_PWM_ARR); d_try = (d_try * 3) / 2 + 1)
-    {
-        float ip = 0.0f;
-        float ltmp = pulse_l_h(vbus, rs, (int16_t)d_try, DETECT_PULSE_US, &ip);
-        (void)ltmp;
-        d = d_try;
-        if (ip >= current_goal_a * 0.7f)
-        {
-            break;
-        }
-        delay_ms(5U);
-    }
-
-    if (samples < 10)
-    {
-        samples = 10;
-    }
-
-    for (i = 0; i < samples; i++)
-    {
-        float ip = 0.0f;
-        float l;
-        int16_t signed_d = ((i & 1) == 0) ? (int16_t)d : (int16_t)(-d);
-        l = pulse_l_h(vbus, rs, signed_d, DETECT_PULSE_US, &ip);
-        if (l > 0.0f)
-        {
-            l_sum += l;
-            i_sum += ip;
-            ok++;
-        }
-        delay_ms(5U);
-    }
-
-    end_inject();
-
-    if (ok < 3)
+    end_inject(); /* HFI manages its own PWM */
+    rc = BSP_HFI_MeasureInductanceCurrent(current_goal_a, sweeps, &hfi);
+    if (rc != 0 || hfi.ok == 0U)
     {
         return BSP_DETECT_ERR_CURRENT;
     }
 
-    *l_uh = (l_sum / (float)ok) * 1.0e6f * DETECT_IND_SCALE;
+    *l_uh = hfi.l_avg_h * 1.0e6f;
     if (ld_lq_diff_uh)
     {
-        *ld_lq_diff_uh = 0.0f;
+        *ld_lq_diff_uh = hfi.ld_lq_diff_h * 1.0e6f;
     }
-    s_res.i_meas_a = i_sum / (float)ok;
-    s_res.vbus_v = vbus;
+    s_res.ls_h = hfi.l_avg_h;
+    s_res.ls_uh = *l_uh;
+    s_res.ld_lq_diff_h = hfi.ld_lq_diff_h;
+    s_res.i_meas_a = hfi.i_avg_a;
+    s_res.vbus_v = read_vbus();
     return BSP_DETECT_OK;
 }
 
