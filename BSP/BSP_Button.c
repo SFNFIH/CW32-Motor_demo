@@ -108,9 +108,6 @@ void BSP_Button_SetDoubleClickCallback(BSP_Button_Callback_t cb)
 
 void BSP_Button_Tick1ms(void)
 {
-    extern volatile uint32_t g_millis;
-    g_millis++;
-
     s_scan_div++;
     if (s_scan_div >= BTN_SCAN_DIV)
     {

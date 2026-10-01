@@ -46,7 +46,7 @@ void BSP_MOTOR_Init(void)
     tim.CounterOPMode = ATIM_OP_MODE_REPETITIVE;
     tim.Prescaler = 0U;
     tim.ReloadValue = BSP_MOTOR_PWM_ARR;
-    tim.RepetitionCounter = 1U;
+    tim.RepetitionCounter = 0U;
     ATIM_Init(&tim);
 
     oc.OCPolarity = ATIM_OCPOLARITY_NONINVERT;
