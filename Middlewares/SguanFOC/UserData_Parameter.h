@@ -13,22 +13,22 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     // +---------------------------------------------------------+
     // |                控制器参数Parameter设计                   |
     // +---------------------------------------------------------+
-    /* DengFOC 2208: Rs≈8Ω, Ls≈4.25mH, Wc≈600 rad/s → Kp≈L*Wc, Ki≈R*Wc */
+    /* 4006: Rs≈0.17Ω, Ls≈55µH, Wc≈2500 → Kp≈L*Wc, Ki≈R*Wc */
     user->transfer.Current_D.Wc = 100.0f;
-    user->transfer.Current_D.Kp = 2.55f;
-    user->transfer.Current_D.Ki = 4800.0f;
+    user->transfer.Current_D.Kp = 0.14f;
+    user->transfer.Current_D.Ki = 425.0f;
     user->transfer.Current_D.Kd = 0.0f;
-    user->transfer.Current_D.OutMax = 8.0f;
-    user->transfer.Current_D.OutMin = -8.0f;
+    user->transfer.Current_D.OutMax = 12.0f;
+    user->transfer.Current_D.OutMin = -12.0f;
     user->transfer.Current_D.IntMax = 80.0f;
     user->transfer.Current_D.IntMin = -80.0f;
     /* =================================== 分割线 ================================= */
     user->transfer.Current_Q.Wc = 100.0f;
-    user->transfer.Current_Q.Kp = 2.55f;
-    user->transfer.Current_Q.Ki = 4800.0f;
+    user->transfer.Current_Q.Kp = 0.14f;
+    user->transfer.Current_Q.Ki = 425.0f;
     user->transfer.Current_Q.Kd = 0.0f;
-    user->transfer.Current_Q.OutMax = 8.0f;
-    user->transfer.Current_Q.OutMin = -8.0f;
+    user->transfer.Current_Q.OutMax = 12.0f;
+    user->transfer.Current_Q.OutMin = -12.0f;
     user->transfer.Current_Q.IntMax = 80.0f;
     user->transfer.Current_Q.IntMin = -80.0f;
 
@@ -56,11 +56,11 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     user->transfer.Velocity.IntMin = -50.0f;        // 双环速度外环speed的STA->积分限幅
     #else // CONFIG_CtrlVel
     user->transfer.Velocity.Wc = 100.0f;
-    user->transfer.Velocity.Kp = 0.04f;
-    user->transfer.Velocity.Ki = 0.25f;
+    user->transfer.Velocity.Kp = 0.08f;
+    user->transfer.Velocity.Ki = 0.4f;
     user->transfer.Velocity.Kd = 0.0f;
-    user->transfer.Velocity.OutMax = 1.2f;          /* Iq 限幅 (A) */
-    user->transfer.Velocity.OutMin = -1.2f;
+    user->transfer.Velocity.OutMax = 4.0f;          /* Iq 限幅 (A)，产品连续可达 18A */
+    user->transfer.Velocity.OutMin = -4.0f;
     user->transfer.Velocity.IntMax = 200.0f;
     user->transfer.Velocity.IntMin = -200.0f;
     #endif // CONFIG_Control
@@ -218,23 +218,23 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     user->transfer.NLFO.Gain = 38000000;            // 非线性磁链->磁链观测解调增益
     #endif // IS_NLFO_MODE
 
-    /* 机械 rad/s：约 40→382rpm 起 SMO，适配 12V/2208 中低速 */
+    /* 机械 rad/s：低阻高 KV，IF→SMO 门槛略抬高 */
     #if CONFIG_MODE>=MODE_Sensorless_HFI
-    user->value.Sensorless_Stop = 90.0f;
-    user->value.Sensorless_Open = 80.0f;
-    user->value.Sensorless_AbsMax = 70.0f;
-    user->value.Sensorless_AbsMin = 55.0f;
-    user->value.Sensorless_Start = 45.0f;
+    user->value.Sensorless_Stop = 120.0f;
+    user->value.Sensorless_Open = 110.0f;
+    user->value.Sensorless_AbsMax = 95.0f;
+    user->value.Sensorless_AbsMin = 70.0f;
+    user->value.Sensorless_Start = 55.0f;
     #endif // CONFIG_MODE
 
 
     // +---------------------------------------------------------+
     // |                电机参数辨识Parameter设计                   |
     // +---------------------------------------------------------+
-    // 1.电机参数辨识设计的参数变量
-    user->motor.identify.go.Set_Uh = 2.0f;          // 电阻电感辨识注入电压幅值
-    user->motor.identify.go.Set_Us = 3.8f;          // 磁链辨识注入电压幅值
-    user->motor.identify.go.Set_Delay = 600.0f;       // 辨识中途延时的单位时间
+    /* 低阻电机注入电压宜小，避免过流 */
+    user->motor.identify.go.Set_Uh = 0.6f;
+    user->motor.identify.go.Set_Us = 1.5f;
+    user->motor.identify.go.Set_Delay = 600.0f;
 }
 
 

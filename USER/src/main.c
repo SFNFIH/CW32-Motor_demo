@@ -17,8 +17,8 @@
 #define APP_HCLK_HZ   96000000U
 #define POT_LO        100U
 #define POT_HI        4000U
-/* 电位器 → 机械角速度 rad/s (约 0~955 rpm) */
-#define SPEED_MAX_RAD 100.0f
+/* 电位器上限约 2865 rpm；4S/KV360 空载可更高，先保守给速 */
+#define SPEED_MAX_RAD 300.0f
 
 volatile uint32_t g_millis;
 
