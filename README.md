@@ -1,7 +1,9 @@
-# CW32L012 + DengFOC 2208 无刷速度闭环
+# CW32L012 + SguanFOC 无感 FOC（DengFOC 2208）
 
 基于 **CW32L012C8**（Cortex-M0+，HSI 96 MHz）的三相无刷电机控制工程。  
-当前主路径：**互补 SPWM / SVPWM 开环 V/f + AS5600 测速闭环**，电位器给定转速，按键启停 / 换向。
+当前主路径：**[SguanFOC v3.1.0](https://github.com/Sguan-ZhouQing/SguanFOC_Library) 无感滑模观测（IF → SMO）**，电位器给定转速，按键启停 / 换向。
+
+库源码位于 `Middlewares/SguanFOC/`（MIT，来自 Sguan-ZhouQing/SguanFOC_Library）。
 
 ---
 
@@ -10,14 +12,15 @@
 | 项目 | 说明 |
 |------|------|
 | 电机 | DengFOC 2208，7 极对，相电阻约 8 Ω，母线约 12 V |
-| 驱动波形 | ATIM 中心对齐互补 PWM，约 **15 kHz**，带死区；中点注入近似 SVPWM |
-| 速度给定 | 电位器 → 约 **15～1350 rpm**（实际可同步上限约 1200 rpm @12 V） |
-| 速度反馈 | AS5600 磁编码器，**硬件 I2C1** |
-| 控制 | `fe` 前馈 + PI 微调；中低速压 V/f、限超前，减轻 100～300 rpm 抖动 |
-| 通信 | UART1 JustFloat（VOFA+）；PyOCD 可读 `g_dbg` 快照 |
+| 控制库 | SguanFOC v3.1.0，`Define_Run_Mode = 8`（`MODE_Sensorless_SMO`） |
+| 驱动波形 | ATIM 中心对齐互补 PWM，**10 kHz**，SVPWM |
+| 电流采样 | 下桥臂 A/B 分流 + 片内 OPA + ADC1，ISR 内采样 |
+| 速度给定 | 电位器 → 约 **0～100 rad/s**（约 0～955 rpm 机械） |
+| 速度反馈 | **无感**：IF 强拖启动 → SMO + PLL |
+| 通信 | UART1 JustFloat（VOFA+ / Sguan 上位机）；串口指令 `MOTOR=1?` / `Speed=50.0?` |
 | 操作 | **单击**启停，**双击**换向 |
 
-> **说明：** 12 V 下反电势会把开环同步速度顶在约 **1200 rpm** 附近；再高需要弱磁或升压。电流环 / 角度 FOC 相关文件仍在仓库中，但当前 `main` 未启用。
+> 旧版 AS5600 V/f 速度闭环代码仍保留在 `BSP/BSP_FOC*.c`、`BSP_AS5600*.c` 等，但当前 `main` 未编入。
 
 ---
 
@@ -31,15 +34,13 @@
 | VH / VL | PB6 / PB3 |
 | WH / WL | PB7 / PB4 |
 
-### AS5600（I2C1）
+### 相电流（ADC1）
 
 | 信号 | 引脚 |
 |------|------|
-| SDA | PC14 |
-| SCL | PC15 |
-| 地址 | `0x36` |
-
-与参考例程 `cw32l012_i2c_master_int` 一致：开漏 + 内部上拉，100 kHz。
+| OPA1 IN+/IN− / OUT（A 相） | PA6 / PA7 / PB0 → ADC1 CH8 |
+| OPA2 IN+/IN− / OUT（B 相） | PA4 / PA5 / PB1 → ADC1 CH9 |
+| 分流电阻 | 10 mΩ，外接反相增益约 10 |
 
 ### 人机与调试
 
@@ -58,143 +59,57 @@
 ## 软件架构
 
 ```
-USER/src/main.c          主循环: 电位器、AS5600、速度环、遥测
-BSP/BSP_FOC.c            V/f 速度闭环 + SPWM 中断
-BSP/BSP_MOTOR.c          ATIM 互补 PWM
-BSP/BSP_AS5600.c         硬件 I2C 磁编
-BSP/BSP_Button.c         单击 / 双击
-BSP/BSP_Potentiometer.c  电位器
-BSP/BSP_UART.c           JustFloat
-BSP/BSP_DebugSnap.c      PyOCD 调试快照 g_dbg
-Libraries/               CW32 标准外设库
+USER/src/main.c                 主循环: SguanFOC_main_Loop、电位器、按键
+USER/src/interrupts_cw32l012.c  ATIM→电流采样+High_Loop；BTIM1→Low_Loop
+Middlewares/SguanFOC/           SguanFOC v3.1.0 无感库 + UserData_* 适配
+BSP/BSP_MOTOR.c                 ATIM 互补 PWM
+BSP/BSP_Current.c               OPA + ADC1 电流原始值
+BSP/BSP_Button.c / Potentiometer / UART / led
+Libraries/                      CW32 标准外设库
 ```
 
-### 控制要点（`BSP_FOC.c`）
+### SguanFOC 三环任务
 
-1. 电位器映射目标转速，斜坡限速。  
-2. AS5600 累计角 + `g_millis` 测机械转速。  
-3. 目标转速 → 电频率 `fe` 前馈；PI 只做小范围修正。  
-4. 中低速降低调制幅度，限制相对实测的 `fe` 超前，避免拧飞失步。  
-5. PWM 中断里推进相位并输出三相占空比；启停只由主循环按键回调处理。
+1. `SguanFOC_High_Loop()` — PWM 中断（10 kHz）：电流、SMO、电流环、SVPWM  
+2. `SguanFOC_Low_Loop()` — 1 ms：状态机 / 保护  
+3. `SguanFOC_main_Loop()` — 主循环：首次初始化、启动校准、JustFloat 发送  
+
+配置入口：`Middlewares/SguanFOC/UserData_Config.h`（模式）、`UserData_Motor.h`（电机/采样）、`UserData_Parameter.h`（PI / 无感切换阈值）。
+
+---
+
+## 调参提示（无感）
+
+| 参数 | 位置 | 说明 |
+|------|------|------|
+| `Target_IF_Iq` | `UserData_Motor.h` | IF 强拖电流，默认 0.45 A |
+| `Sensorless_*` | `UserData_Parameter.h` | IF→SMO 机械角速度门槛（rad/s） |
+| 电流环 Kp/Ki | `UserData_Parameter.h` | 按 Rs/Ls 粗调，默认按 8 Ω / 4.25 mH |
+| `Current_Dir0/1` | `UserData_Motor.h` | 反相运放为 −1；若电流极性反了再改 |
+| `Motor_Dir` | `UserData_Motor.h` | 相序反了改为 −1 |
+
+串口（115200）：`MOTOR=1?` 启动，`MOTOR=0?` 停止，`Speed=60.0?` 给定机械 rad/s。
 
 ---
 
 ## 环境依赖
 
-- `arm-none-eabi-gcc`（可用 STM32CubeCLT 自带工具链）
-- CMake ≥ 3.22
-- Python3 + **pyOCD**（建议独立 venv）
-- CMSIS Pack：`WHXY/CW32L012_DFP`（不在公网索引，需本地安装）
-
-Pack 默认路径：
-
-```text
-~/.local/share/cmsis-pack-manager/WHXY/CW32L012_DFP/1.0.2.pack
-```
-
-安装 / 更新：
-
-```bash
-python3 scripts/install_cw32_pack.py
-# 或指定本地 pack：
-python3 scripts/install_cw32_pack.py /path/to/WHXY.CW32L012_DFP.1.0.2.pack
-```
-
----
-
-## 编译
+- `arm-none-eabi-gcc`
+- CMake ≥ 3.22 + Ninja
+- Python3 + **pyOCD**（烧录/调试）
+- CMSIS Pack：`WHXY/CW32L012_DFP`
 
 ```bash
 cmake --preset Debug
-cmake --build build/Debug -j
+cmake --build --preset Debug
+python3 flash_cw32.py   # 或按 README 原有 pyocd 流程
 ```
 
-产物：
-
-- `build/Debug/cw32l012_blank.elf`
-- 同目录 `.hex` / `.bin`
+当前 Debug 镜像约占用 Flash ~52%、RAM ~45%（8 KB SRAM / 64 KB Flash）。
 
 ---
 
-## 烧录
+## 许可
 
-关闭占用调试口的串口软件后：
-
-```bash
-python3 flash_cw32.py build/Debug/cw32l012_blank.elf
-```
-
-或：
-
-```bash
-/home/tony/DAPLink/third_party/DAPLink/venv/bin/python flash_cw32.py
-```
-
-`pyocd.yml` 已配置目标 `cw32l012c8` 与 pack 路径。连接方式：`under-reset`。
-
----
-
-## 使用说明
-
-1. 接好电机、12 V 母线、AS5600、电位器。  
-2. 烧录后复位，LED 未亮表示停机。  
-3. **单击按键**启动；拧电位器调速（建议从低速慢慢升高）。  
-4. 再 **单击** 停止；**双击** 切换旋转方向。  
-5. 约 **40 rpm** 起可较稳跟随；**100～300 rpm** 已针对抖动做了 V/f 与 PI 柔化；高于约 **1120～1200 rpm** 会接近 12 V 反电势上限，继续拧电位器不会明显再升速，但应保持同步而不失步崩溃。
-
----
-
-## 调试与遥测
-
-### VOFA+ JustFloat
-
-UART1 周期发送 8 个 float，例如：
-
-| 序号 | 含义 |
-|------|------|
-| 0 | mode（0 停 / 1 开环爬升 / 2 闭环 / 4 失步恢复） |
-| 1 | `fe_x10` 指令 |
-| 2 | 目标转速（rpm） |
-| 3 | 电角度（rad，抽样） |
-| 4 | AS5600 raw |
-| 5 | 实测转速（rpm） |
-| 6 | 电位器归一化 0～1000 |
-| 7 | 电位器 ADC |
-
-### PyOCD 快照
-
-全局 `g_dbg`（见 `BSP_DebugSnap.h`）含 `as_ok`、`as_raw`、`as_cum`、mode 等。  
-可用 `scripts/pyocd_loop_debug.py` 或自写脚本读写；`g_force_duty` 非 0 时可强制速度给定（便于自动化测速）。
-
-注意：用调试器 **halt** 测转速会干扰时序；应用 `as_cum` 在运行中做墙钟差分更可靠。
-
----
-
-## 已知限制
-
-- 当前为 **开环 V/f + 编码器测速**，不是电流环 FOC；极低速顺滑度、抗负载能力有限。  
-- 母线约 12 V 时机械转速上限约 **1.2 krpm** 量级。  
-- 仓库内仍有 `BSP_Sensorless` / `BSP_BEMF` / `BSP_Current` 等历史模块，默认未接入 `main`。  
-- I2C 与电机同板时请保证地线良好；AS5600 需磁铁对准、`STATUS.MD` 有效。
-
----
-
-## 目录结构
-
-| 路径 | 说明 |
-|------|------|
-| `BSP/` | 板级驱动与控制 |
-| `USER/` | `main`、中断、`SystemInit` 覆盖 |
-| `Libraries/` | CW32 外设库 |
-| `Doc/` | 原理图等资料 |
-| `cmake/` | `arm-none-eabi` 工具链 |
-| `scripts/` | pack 安装、调试辅助 |
-| `flash_cw32.py` | pyOCD 烧录入口 |
-| `cw32l012_flash.ld` | 链接脚本 |
-| `startup_cw32l012x8.s` | 启动文件 |
-
----
-
-## License
-
-本仓库以学习与个人开发为目的；CW32 库文件请遵循原厂许可。
+- 本工程应用层：随仓库原许可
+- `Middlewares/SguanFOC/`：MIT（见该目录 `LICENSE`），版权属 Sguan / ZhouQing

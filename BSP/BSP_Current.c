@@ -1,6 +1,6 @@
 /**
  * @file    BSP_Current.c
- * @brief   片内运放独立模式 (外接 20 倍反相), ADC1 读 PB0/PB1
+ * @brief   片内运放独立模式 (外接反相增益) + ADC1 读 PB0/PB1
  */
 #include "BSP_Current.h"
 #include "BSP_motor_params.h"
@@ -12,10 +12,12 @@
 static float s_off_a = 2048.0f;
 static float s_off_b = 2048.0f;
 static float s_scale;
+static volatile uint16_t s_raw_a = 2048U;
+static volatile uint16_t s_raw_b = 2048U;
 
 static uint8_t adc_pair(uint16_t *a, uint16_t *b)
 {
-    uint32_t n = 80U;
+    uint32_t n = 200U;
 
     ADC_ClearITPendingBit(CW_ADC1, ADC_IT_EOC | ADC_IT_EOS);
     ADC_SoftwareStartConvCmd(CW_ADC1, ENABLE);
@@ -55,24 +57,43 @@ void BSP_Current_Calibrate(void)
     {
         s_off_a = sa / (float)n;
         s_off_b = sb / (float)n;
+        s_raw_a = (uint16_t)s_off_a;
+        s_raw_b = (uint16_t)s_off_b;
     }
 }
 
-uint8_t BSP_Current_Read(float *ia, float *ib)
+void BSP_Current_Sample(void)
 {
     uint16_t a;
     uint16_t b;
 
+    if (adc_pair(&a, &b) != 0U)
+    {
+        s_raw_a = a;
+        s_raw_b = b;
+    }
+}
+
+uint16_t BSP_Current_GetRawA(void)
+{
+    return s_raw_a;
+}
+
+uint16_t BSP_Current_GetRawB(void)
+{
+    return s_raw_b;
+}
+
+uint8_t BSP_Current_Read(float *ia, float *ib)
+{
     if ((ia == 0) || (ib == 0))
     {
         return 0U;
     }
-    if (adc_pair(&a, &b) == 0U)
-    {
-        return 0U;
-    }
-    *ia = ((float)a - s_off_a) * s_scale;
-    *ib = ((float)b - s_off_b) * s_scale;
+    BSP_Current_Sample();
+    /* 外接反相: I = (offset - adc) * scale */
+    *ia = (s_off_a - (float)s_raw_a) * s_scale;
+    *ib = (s_off_b - (float)s_raw_b) * s_scale;
     return 1U;
 }
 
@@ -107,10 +128,10 @@ void BSP_Current_Init(void)
     OPA_Init(CW_OPA2, &opa);
     OPA_Start(CW_OPA2);
 
-    ch.ADC_SampTime = ADC_SampTime54Clk;
+    ch.ADC_SampTime = ADC_SampTime24Clk;
     ch.ADC_InputChannel = ADC_InputCH8;
 
-    adc.ADC_ClkDiv = ADC_Clk_Div8;
+    adc.ADC_ClkDiv = ADC_Clk_Div4;
     adc.ADC_ConvertMode = ADC_ConvertMode_Once;
     adc.ADC_SlaveMod = ADC_SlaveMode_Disable;
     adc.ADC_SQREns = ADC_SqrEns0to1;
@@ -126,6 +147,5 @@ void BSP_Current_Init(void)
     ADC_Init(CW_ADC1, &adc);
     ADC_Enable(CW_ADC1);
 
-    /* I = (offset - adc) * Vref / 4096 / (Rshunt * gain) */
     s_scale = CUR_VREF_V / (4096.0f * CUR_SHUNT_OHM * CUR_AMP_GAIN);
 }

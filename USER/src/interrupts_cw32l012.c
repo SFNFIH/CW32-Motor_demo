@@ -1,11 +1,16 @@
 /**
  * @file    interrupts_cw32l012.c
- * @brief   Interrupt Service Routines
+ * @brief   Interrupt Service Routines — SguanFOC 无感
  */
 #include "../inc/main.h"
-#include "BSP_FOC.h"
 #include "BSP_Button.h"
+#include "BSP_Current.h"
+#include "BSP_MOTOR.h"
+#include "cw32l012_atim.h"
 #include "cw32l012_btim.h"
+#include "SguanFOC.h"
+
+extern volatile uint32_t g_millis;
 
 void NMI_Handler(void) {}
 
@@ -34,7 +39,12 @@ void ADC1_IRQHandler(void) {}
 
 void ATIM_IRQHandler(void)
 {
-    BSP_FOC_PwmIrq();
+    if (ATIM_GetITStatus(ATIM_STATE_UIF) != RESET)
+    {
+        ATIM_ClearITPendingBit(ATIM_STATE_UIF);
+        BSP_Current_Sample();
+        SguanFOC_High_Loop();
+    }
 }
 
 void VC13_IRQHandler(void) {}
@@ -50,7 +60,9 @@ void BTIM1_IRQHandler(void)
     if (BTIM_GetITStatus(CW_BTIM1, BTIM_IT_UPDATE) != RESET)
     {
         BTIM_ClearITPendingBit(CW_BTIM1, BTIM_IT_UPDATE);
+        g_millis++;
         BSP_Button_Tick1ms();
+        SguanFOC_Low_Loop();
     }
 }
 
