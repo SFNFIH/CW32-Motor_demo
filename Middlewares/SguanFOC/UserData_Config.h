@@ -1,12 +1,12 @@
 #ifndef __USERDATA_CONFIG_H
 #define __USERDATA_CONFIG_H
-/* CW32L012 + DengFOC 2208 — SguanFOC v3.1.0 无感配置 */
+/* CW32L012 + 4006 KV380 — SguanFOC v3.1.0 无感配置 */
 
 /**
- * 无感滑模观测 (IF 开环启动 → SMO)
+ * 10 = MODE_Sensorless_HS：HFI(低速带载) + SMO(中高速)
  * 需要电流采样；不依赖运行时编码器
  */
-#define Define_Run_Mode 8
+#define Define_Run_Mode 10
 
 /** 速度环用 PID（M0+ 软浮点更轻） */
 #define Switch_MOTOR_Control_Vel 0

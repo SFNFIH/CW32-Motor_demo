@@ -59,8 +59,8 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     user->transfer.Velocity.Kp = 0.08f;
     user->transfer.Velocity.Ki = 0.4f;
     user->transfer.Velocity.Kd = 0.0f;
-    user->transfer.Velocity.OutMax = 4.0f;          /* Iq 限幅 (A)，产品连续可达 18A */
-    user->transfer.Velocity.OutMin = -4.0f;
+    user->transfer.Velocity.OutMax = 6.0f;          /* 带载 Iq 限幅 (A)，软件过流 8A */
+    user->transfer.Velocity.OutMin = -6.0f;
     user->transfer.Velocity.IntMax = 200.0f;
     user->transfer.Velocity.IntMin = -200.0f;
     #endif // CONFIG_Control
@@ -191,18 +191,18 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     user->transfer.Hall.Hall_Low = 0.4f;            // 霍尔信号处理->信号下边界
     #endif // IS_HALL_MODE
 
-    // 17.高频正弦波注入相关
+    // 17.高频正弦波注入相关（4006 低阻：Uh/NSD.Ud 宜偏小，带载可略加大 Uh）
     #if IS_HFI_MODE
-    user->transfer.HFI.Wo = 6855.8f;                // 高频正弦波->注入电压角频率
-    user->transfer.HFI.h = 1.0f;                    // 高频正弦波->高频解调增益
-    user->transfer.HFI.Uh = 1.5f;                   // 高频正弦波->注入电压幅值
-    user->transfer.HFI.K1 = 0.3f;                   // 高频正弦波->陷波分母系数
-    user->transfer.HFI.K2 = 0.0f;                   // 高频正弦波->陷波分子系数
-    user->transfer.HFI.zeta = 0.2f;                 // 高频正弦波->带通滤波阻尼比
+    user->transfer.HFI.Wo = 6283.2f;                // ≈1 kHz 注入角频率
+    user->transfer.HFI.h = 1.0f;
+    user->transfer.HFI.Uh = 1.2f;                   // 带载启动注入幅值 (V)
+    user->transfer.HFI.K1 = 0.3f;
+    user->transfer.HFI.K2 = 0.0f;
+    user->transfer.HFI.zeta = 0.2f;
 
-    user->transfer.NSD.zeta = 0.2f;                 // NSD转子极性辨识->带通滤波阻尼比
-    user->transfer.NSD.Ud = 3.8f;                   // NSD转子极性辨识->偏置D轴电压幅值
-    user->transfer.NSD.Cycle = 0.5f;                // NSD转子极性辨识->辨识的总周期
+    user->transfer.NSD.zeta = 0.2f;
+    user->transfer.NSD.Ud = 1.0f;                   // 极性辨识偏置电压，低阻电机勿过大
+    user->transfer.NSD.Cycle = 0.5f;
     #endif // IS_HFI_MODE
 
     // 18.滑模观测器
@@ -218,13 +218,13 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
     user->transfer.NLFO.Gain = 38000000;            // 非线性磁链->磁链观测解调增益
     #endif // IS_NLFO_MODE
 
-    /* 机械 rad/s：低阻高 KV，IF→SMO 门槛略抬高 */
+    /* HFI↔SMO 融合区（机械 rad/s）；带载低速靠 HFI */
     #if CONFIG_MODE>=MODE_Sensorless_HFI
-    user->value.Sensorless_Stop = 120.0f;
-    user->value.Sensorless_Open = 110.0f;
-    user->value.Sensorless_AbsMax = 95.0f;
-    user->value.Sensorless_AbsMin = 70.0f;
-    user->value.Sensorless_Start = 55.0f;
+    user->value.Sensorless_Stop = 140.0f;
+    user->value.Sensorless_Open = 125.0f;
+    user->value.Sensorless_AbsMax = 110.0f;
+    user->value.Sensorless_AbsMin = 75.0f;
+    user->value.Sensorless_Start = 60.0f;
     #endif // CONFIG_MODE
 
 

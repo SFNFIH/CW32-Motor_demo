@@ -2124,8 +2124,8 @@ static void Sguan_Calculate_main_Loop(SguanFOC_System_STRUCT *sguan){
         Transfer_Init(sguan);
         Offset_Current_Init(sguan);
 
-#if IS_IF_MODE && !IS_DEBUG_MODE
-        /* 纯无感: 不依赖编码器对齐, 保留 User_Motor_Init 的 Motor_Dir */
+#if (IS_IF_MODE || IS_COM_MODE || (CONFIG_MODE == MODE_Sensorless_HFI)) && !IS_DEBUG_MODE
+        /* 纯无感(含 HFI/HS): 不依赖编码器对齐, 保留 User_Motor_Init 的 Motor_Dir */
         sguan->foc.Ud_in = 0.0f;
         sguan->foc.Uq_in = 0.0f;
         User_Delay(20);

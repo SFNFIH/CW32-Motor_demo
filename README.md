@@ -1,7 +1,7 @@
 # CW32L012 + SguanFOC 无感 FOC（4006 KV380）
 
 基于 **CW32L012C8**（Cortex-M0+，HSI 96 MHz）的三相无刷电机控制工程。  
-当前主路径：**[SguanFOC v3.1.0](https://github.com/Sguan-ZhouQing/SguanFOC_Library) 无感滑模观测（IF → SMO）**，电位器给定转速，按键启停 / 换向。
+当前主路径：**[SguanFOC v3.1.0](https://github.com/Sguan-ZhouQing/SguanFOC_Library) 无感 HFI+SMO（模式 10，带载低速可起）**，电位器给定转速，按键启停 / 换向。
 
 库源码位于 `Middlewares/SguanFOC/`（MIT，来自 Sguan-ZhouQing/SguanFOC_Library）。
 
@@ -12,11 +12,11 @@
 | 项目 | 说明 |
 |------|------|
 | 电机 | **4006 KV380**，转子 14 极（7 极对），Rs≈170 mΩ，KV360，4–6S，连续约 18 A |
-| 控制库 | SguanFOC v3.1.0，`Define_Run_Mode = 8`（`MODE_Sensorless_SMO`） |
+| 控制库 | SguanFOC v3.1.0，`Define_Run_Mode = 10`（`MODE_Sensorless_HS`：HFI+SMO） |
 | 驱动波形 | ATIM 中心对齐互补 PWM，**10 kHz**，SVPWM |
 | 电流采样 | 下桥臂 A/B 分流 + 片内 OPA + ADC1，ISR 内采样 |
 | 速度给定 | 电位器 → 约 **0～300 rad/s**（约 0～2865 rpm 机械） |
-| 速度反馈 | **无感**：IF 强拖启动 → SMO + PLL |
+| 速度反馈 | **无感**：低速 HFI（带载）→ 中高速 SMO，融合切换 |
 | 通信 | UART1 JustFloat（VOFA+ / Sguan 上位机）；串口指令 `MOTOR=1?` / `Speed=50.0?` |
 | 操作 | **单击**启停，**双击**换向 |
 
@@ -82,8 +82,8 @@ Libraries/                      CW32 标准外设库
 
 | 参数 | 位置 | 说明 |
 |------|------|------|
-| `Target_IF_Iq` | `UserData_Motor.h` | IF 强拖电流，默认 1.5 A（空载约 0.3 A） |
-| `Sensorless_*` | `UserData_Parameter.h` | IF→SMO 机械角速度门槛（rad/s） |
+| `HFI.Uh` / `NSD.Ud` | `UserData_Parameter.h` | 注入/极性辨识电压；带载无力可略加大 Uh |
+| `Sensorless_*` | `UserData_Parameter.h` | HFI↔SMO 融合门槛（机械 rad/s） |
 | 电流环 Kp/Ki | `UserData_Parameter.h` | 按 Rs/Ls 粗调，默认 0.17 Ω / 55 µH |
 | `Current_Dir0/1` | `UserData_Motor.h` | 反相运放为 −1；若电流极性反了再改 |
 | `Motor_Dir` | `UserData_Motor.h` | 相序反了改为 −1 |
