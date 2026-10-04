@@ -11,8 +11,9 @@
 extern "C" {
 #endif
 
-#define BSP_MOTOR_PWM_ARR       3199U
-#define BSP_MOTOR_PWM_HZ        15000U
+/* 96 MHz, 中心对齐: f = 96e6 / (2*(ARR+1)) → 10 kHz */
+#define BSP_MOTOR_PWM_ARR       4799U
+#define BSP_MOTOR_PWM_HZ        10000U
 #define BSP_MOTOR_PWM_DEADTIME  64U
 
 void BSP_MOTOR_Init(void);

@@ -14,6 +14,8 @@ extern "C" {
 #include "cw32l012_sysctrl.h"
 #include "BSP_led.h"
 
+void App_Tick1ms(void);
+
 #ifdef __cplusplus
 }
 #endif

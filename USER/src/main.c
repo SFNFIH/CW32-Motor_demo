@@ -1,28 +1,30 @@
 /**
  * @file    main.c
- * @brief   AS5600 速度闭环: 电位器给转速目标, 磁编反馈
+ * @brief   SguanFOC VF 开环：上电启动，AS5600 在 ESP32 侧 ttyACM0 观察
  */
 #include "main.h"
 #include "BSP_UART.h"
 #include "BSP_Button.h"
 #include "BSP_Potentiometer.h"
-#include "BSP_FOC.h"
-#include "BSP_AS5600.h"
-#include "BSP_DebugSnap.h"
+#include "BSP_MOTOR.h"
+#include "BSP_Current.h"
+#include "BSP_led.h"
+#include "BSP_motor_params.h"
+#include "cw32l012_btim.h"
+#include "SguanFOC.h"
+#include "Sguan_MotorStatus.h"
+#include <stdio.h>
 
-#define APP_HCLK_HZ   96000000U
-#define POT_LO        100U
-#define POT_HI        4000U
+#define APP_HCLK_HZ 96000000U
+
+volatile uint32_t g_millis;
 
 static void SYSCTRL_Configuration(void);
-static void DelayMs(uint32_t ms);
-static uint16_t PotToSpeed(uint16_t adc);
+static void BTIM1_1ms_Init(void);
 static void OnClick(void);
 static void OnDoubleClick(void);
-
-static volatile uint8_t s_req_run;
-static volatile uint8_t s_req_dir;
-static uint8_t s_motor_on;
+static int8_t s_speed_sign = 1;
+static uint8_t s_started;
 
 void InitTick(uint32_t HclkFreq)
 {
@@ -31,37 +33,92 @@ void InitTick(uint32_t HclkFreq)
     SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
 }
 
-static uint16_t PotToSpeed(uint16_t adc)
+static void AppStart(void)
 {
-    uint32_t x;
+    Sguan.motor.PWM_Dir = 1;
+    Sguan.motor.Motor_Dir = 1;
+    Sguan.motor.Duty = BSP_MOTOR_PWM_ARR;
+    Sguan.motor.VBUS = MOTOR_VBUS_V;
+    Sguan.foc.Real_VBUS = MOTOR_VBUS_V;
+    Sguan.foc.Target_VF_Uq = 2.5f;
+    BSP_MOTOR_Start();
+    BSP_LED_On();
+    Sguan.Func_Start();
+    SguanFOC_main_Loop();
+    Sguan.foc.Target_VF_Uq = 2.5f;
+    Sguan.Func_Set_Velocity(60.0f);
+    BSP_MOTOR_EnablePwmIrq();
+    s_started = 1U;
+}
 
-    if (adc <= POT_LO)
+static void AppStop(void)
+{
+    Sguan.Func_Stop();
+    BSP_MOTOR_DisablePwmIrq();
+    BSP_MOTOR_Stop();
+    BSP_LED_Off();
+    s_started = 0U;
+}
+
+void App_Tick1ms(void)
+{
+    static uint8_t pot_div;
+    uint16_t adc;
+    float spd;
+
+    BSP_Button_Tick1ms();
+
+    pot_div++;
+    if (pot_div < 10U)
     {
-        return 0U;
+        return;
     }
-    if (adc >= POT_HI)
+    pot_div = 0U;
+
+    if ((s_started == 0U) ||
+        (Sguan.status < MOTOR_STATUS_IDLE) ||
+        (Sguan.status >= MOTOR_STATUS_OVERVOLTAGE))
     {
-        return 1000U;
+        return;
     }
-    x = ((uint32_t)adc - POT_LO) * 1000U / (POT_HI - POT_LO);
-    return (uint16_t)x;
+
+    adc = BSP_Potentiometer_Read();
+    if (adc < 100U)
+    {
+        spd = 50.0f;
+    }
+    else if (adc > 4000U)
+    {
+        spd = 120.0f;
+    }
+    else
+    {
+        spd = 50.0f + ((float)(adc - 100U) * 70.0f) / 3900.0f;
+    }
+    Sguan.foc.Target_VF_Uq = 2.5f;
+    Sguan.Func_Set_Velocity((float)s_speed_sign * spd);
 }
 
 static void OnClick(void)
 {
-    s_req_run = 1U;
+    if (s_started != 0U)
+    {
+        AppStop();
+    }
+    else
+    {
+        AppStart();
+    }
 }
 
 static void OnDoubleClick(void)
 {
-    s_req_dir = 1U;
+    s_speed_sign = (int8_t)(-s_speed_sign);
 }
 
 int main(void)
 {
-    float telemetry[8];
-    uint16_t pot;
-    uint16_t speed;
+    uint32_t last_tx = 0U;
 
     SYSCTRL_Configuration();
     InitTick(APP_HCLK_HZ);
@@ -69,103 +126,53 @@ int main(void)
     BSP_LED_Init();
     BSP_UART_Init();
     BSP_Potentiometer_Init();
-    BSP_AS5600_Init(APP_HCLK_HZ);
-    BSP_FOC_Init();
-    BSP_DebugSnap_Init();
-    g_force_duty = 0U;
+    BSP_Current_Init();
+    BSP_MOTOR_Init();
     BSP_Button_Init();
     BSP_Button_SetClickCallback(OnClick);
     BSP_Button_SetDoubleClickCallback(OnDoubleClick);
+    BTIM1_1ms_Init();
+
+    AppStart();
 
     while (1)
     {
-        const BSP_FOC_State_t *st;
-        const BSP_AS5600_State_t *as;
-        uint32_t cmd = BSP_DebugSnap_TakeCmd();
+        char line[96];
+        int n;
 
-        if (cmd == DBG_CMD_START)
+        SguanFOC_main_Loop();
+
+        if ((g_millis - last_tx) >= 200U)
         {
-            s_req_run = 1U;
-        }
-        else if (cmd == DBG_CMD_STOP)
-        {
-            if (s_motor_on != 0U)
+            last_tx = g_millis;
+            n = snprintf(line, sizeof(line),
+                         "st=%u spd=%d uq=%d dir=%d\r\n",
+                         (unsigned)Sguan.status,
+                         (int)Sguan.encoder.Real_Speed,
+                         (int)(Sguan.foc.Uq_in * 100.0f),
+                         (int)s_speed_sign);
+            if (n > 0)
             {
-                BSP_FOC_Stop();
-                BSP_LED_Off();
-                s_motor_on = 0U;
+                BSP_UART_Write(line, (uint32_t)n);
             }
         }
-        else if (cmd == DBG_CMD_TOGGLE_DIR)
-        {
-            s_req_dir = 1U;
-        }
-
-        if (s_req_run != 0U)
-        {
-            s_req_run = 0U;
-            if (s_motor_on != 0U)
-            {
-                BSP_FOC_Stop();
-                BSP_LED_Off();
-                s_motor_on = 0U;
-            }
-            else
-            {
-                s_motor_on = 1U;
-                BSP_LED_On();
-                BSP_FOC_Start();
-            }
-        }
-        if (s_req_dir != 0U)
-        {
-            s_req_dir = 0U;
-            BSP_FOC_ToggleDirection();
-        }
-
-        pot = BSP_Potentiometer_Read();
-        speed = PotToSpeed(pot);
-        if (g_force_duty != 0U)
-        {
-            speed = g_force_duty;
-            if (speed > 1000U)
-            {
-                speed = 1000U;
-            }
-        }
-
-        BSP_AS5600_Update();
-        as = BSP_AS5600_GetState();
-        BSP_FOC_OnEncoder(as->raw, (as->ok != 0U) && (as->mag_ok != 0U) ? 1U : 0U);
-        BSP_FOC_OnEncoderRpm(as->rpm_x10);
-        BSP_FOC_OnEncoderCum(as->cum_raw);
-
-        if (s_motor_on != 0U)
-        {
-            BSP_FOC_SetSpeed(speed);
-            BSP_FOC_SpeedLoop();
-        }
-
-        st = BSP_FOC_GetState();
-        if ((s_motor_on != 0U) && (st->running == 0U))
-        {
-            BSP_LED_Off();
-            s_motor_on = 0U;
-        }
-        BSP_DebugSnap_Publish(st, pot, s_motor_on);
-
-        /* VOFA: mode, fe_x10, rpm_ref, theta, as_raw, rpm_meas, speed_pm, pot */
-        telemetry[0] = (float)st->mode;
-        telemetry[1] = st->id_a;          /* fe_x10 指令 */
-        telemetry[2] = st->iq_a;          /* 目标 rpm */
-        telemetry[3] = st->theta;
-        telemetry[4] = (float)as->raw;
-        telemetry[5] = st->rpm;           /* 实测 rpm */
-        telemetry[6] = (float)speed;
-        telemetry[7] = (float)pot;
-        BSP_UART_SendJustFloat(telemetry, 8U);
-        DelayMs(2U);
     }
+}
+
+static void BTIM1_1ms_Init(void)
+{
+    BTIM_TimeBaseInitTypeDef tb = {0};
+
+    __SYSCTRL_BTIM123_CLK_ENABLE();
+    tb.BTIM_Mode = BTIM_MODE_TIMER;
+    tb.BTIM_CountMode = BTIM_COUNT_MODE_REPETITIVE;
+    tb.BTIM_Prescaler = 95U;
+    tb.BTIM_Period = 999U;
+    BTIM_TimeBaseInit(CW_BTIM1, &tb);
+    BTIM_ITConfig(CW_BTIM1, BTIM_IT_UPDATE, ENABLE);
+    BTIM_Cmd(CW_BTIM1, ENABLE);
+    NVIC_SetPriority(BTIM1_IRQn, 0U);
+    NVIC_EnableIRQ(BTIM1_IRQn);
 }
 
 static void SYSCTRL_Configuration(void)
@@ -177,16 +184,6 @@ static void SYSCTRL_Configuration(void)
     __SYSCTRL_GPIOA_CLK_ENABLE();
     __SYSCTRL_GPIOB_CLK_ENABLE();
     __SYSCTRL_GPIOC_CLK_ENABLE();
-}
-
-static void DelayMs(uint32_t ms)
-{
-    while (ms--)
-    {
-        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0U)
-        {
-        }
-    }
 }
 
 #ifdef USE_FULL_ASSERT
