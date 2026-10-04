@@ -49,14 +49,19 @@ static void Button_Scan(void)
         {
             uint8_t prev = s_stable;
             s_stable = raw;
-            if ((prev == BTN_PRESSED) && (s_stable == BTN_RELEASED))
+            /* 按下即响应：不必等松开 + 双击窗口 */
+            if ((prev == BTN_RELEASED) && (s_stable == BTN_PRESSED))
             {
-                s_click_cnt++;
-                if (s_click_cnt == 1U)
+                if (s_click_cnt == 0U)
                 {
+                    s_click_cnt = 1U;
                     s_wait_ticks = BTN_DBLCLICK_TICKS;
+                    if (s_click_cb != NULL)
+                    {
+                        s_click_cb();
+                    }
                 }
-                else if (s_click_cnt >= 2U)
+                else
                 {
                     s_click_cnt = 0U;
                     s_wait_ticks = 0U;
@@ -75,10 +80,6 @@ static void Button_Scan(void)
         if ((s_wait_ticks == 0U) && (s_click_cnt == 1U))
         {
             s_click_cnt = 0U;
-            if (s_click_cb != NULL)
-            {
-                s_click_cb();
-            }
         }
     }
 }
@@ -94,6 +95,7 @@ void BSP_Button_Init(void)
     s_wait_ticks   = 0U;
     s_scan_div     = 0U;
     Button_GPIO_Init();
+    PB10_AFx_GPIO();
 }
 
 void BSP_Button_SetClickCallback(BSP_Button_Callback_t cb)

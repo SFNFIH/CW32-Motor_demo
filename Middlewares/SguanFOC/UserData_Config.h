@@ -2,11 +2,8 @@
 #define __USERDATA_CONFIG_H
 /* CW32L012 + 4006 KV380 — SguanFOC v3.1.0 无感配置 */
 
-/**
- * 10 = MODE_Sensorless_HS：HFI(低速带载) + SMO(中高速)
- * 需要电流采样；不依赖运行时编码器
- */
-#define Define_Run_Mode 10
+/* 0 = VF 开环。M0+ 上先用库把电机拖转；无感 HFI/SMO 暂不启用。 */
+#define Define_Run_Mode 0
 
 /** 速度环用 PID（M0+ 软浮点更轻） */
 #define Switch_MOTOR_Control_Vel 0
@@ -23,7 +20,7 @@
 #define Switch_Cogging_Calculate 0
 
 #define Open_AngleComp_Calculate 0
-#define Open_Current_Feedforward 1
+#define Open_Current_Feedforward 0
 #define Open_Velocity_Feedforward 0
 #define Open_DOB_Calculate 0
 #define Open_Inhibit_Calculate 0

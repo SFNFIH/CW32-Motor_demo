@@ -15,19 +15,19 @@ static void gpio_init(void)
     __SYSCTRL_GPIOA_CLK_ENABLE();
     __SYSCTRL_GPIOB_CLK_ENABLE();
 
-    PB05_AFx_ATIMCH1();
-    PB06_AFx_ATIMCH2();
-    PB07_AFx_ATIMCH3();
-    PA15_AFx_ATIMCH1N();
-    PB03_AFx_ATIMCH2N();
-    PB04_AFx_ATIMCH3N();
-
     g.Mode = GPIO_MODE_OUTPUT_PP;
     g.IT = GPIO_IT_NONE;
     g.Pins = GPIO_PIN_15;
     GPIO_Init(CW_GPIOA, &g);
     g.Pins = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
     GPIO_Init(CW_GPIOB, &g);
+
+    PB05_AFx_ATIMCH1();
+    PB06_AFx_ATIMCH2();
+    PB07_AFx_ATIMCH3();
+    PA15_AFx_ATIMCH1N();
+    PB03_AFx_ATIMCH2N();
+    PB04_AFx_ATIMCH3N();
 }
 
 void BSP_MOTOR_Init(void)
@@ -41,7 +41,7 @@ void BSP_MOTOR_Init(void)
     ATIM_DeInit();
 
     tim.BufferState = ENABLE;
-    tim.CounterAlignedMode = ATIM_COUNT_ALIGN_MODE_CENTER_BOTH;
+    tim.CounterAlignedMode = ATIM_COUNT_ALIGN_MODE_CENTER_DOWN;
     tim.CounterDirection = ATIM_COUNTING_UP;
     tim.CounterOPMode = ATIM_OP_MODE_REPETITIVE;
     tim.Prescaler = 0U;
@@ -113,7 +113,7 @@ void BSP_MOTOR_EnablePwmIrq(void)
     ATIM_ClearITPendingBit(ATIM_STATE_UIF);
     ATIM_ITConfig(ATIM_IT_UIE, ENABLE);
     NVIC_ClearPendingIRQ(ATIM_IRQn);
-    NVIC_SetPriority(ATIM_IRQn, 0U);
+    NVIC_SetPriority(ATIM_IRQn, 1U);
     NVIC_EnableIRQ(ATIM_IRQn);
 }
 

@@ -6,6 +6,7 @@
 #include "BSP_Current.h"
 #include "BSP_UART.h"
 #include "BSP_led.h"
+#include "BSP_motor_params.h"
 #include "SguanFOC.h"
 
 extern volatile uint32_t g_millis;
@@ -14,22 +15,32 @@ static inline void User_Delay(uint32_t ms);
 
 static inline void User_Initial_Init(void)
 {
-    /* PWM / 1ms 中断在 main 里已打开；此处可补二次使能 */
-    BSP_MOTOR_EnablePwmIrq();
+    Sguan.motor.PWM_Dir = 1;
+    Sguan.motor.Motor_Dir = 1;
+    Sguan.motor.Duty = BSP_MOTOR_PWM_ARR;
+    Sguan.motor.VBUS = MOTOR_VBUS_V;
+    Sguan.foc.Real_VBUS = MOTOR_VBUS_V;
 }
 
 static inline void User_StartMotor_Init(void)
 {
-    BSP_Current_Calibrate();
+    Sguan.foc.Real_VBUS = MOTOR_VBUS_V;
+    Sguan.motor.PWM_Dir = 1;
+    Sguan.motor.Duty = BSP_MOTOR_PWM_ARR;
     BSP_MOTOR_Start();
     BSP_LED_On();
 }
 
 static inline void User_Delay(uint32_t ms)
 {
-    uint32_t start = g_millis;
-    while ((g_millis - start) < ms)
+    /* 用 SysTick COUNTFLAG，不依赖 BTIM（PWM ISR 过重时 g_millis 会停） */
+    uint32_t i;
+    (void)SysTick->CTRL;
+    for (i = 0U; i < ms; i++)
     {
+        while ((SysTick->CTRL & SysTick_CTRL_COUNTFLAG_Msk) == 0U)
+        {
+        }
     }
 }
 
@@ -69,13 +80,12 @@ static inline void User_PwmDuty_Set(uint32_t Duty_u,
 
 static inline float User_VBUS_DataGet(void)
 {
-    /* 使用标定母线电压；避免与电位器抢 ADC2 */
-    return (float)0xFF800000;
+    return MOTOR_VBUS_V;
 }
 
 static inline float User_Temperature_DataGet(void)
 {
-    return (float)0xFF800000;
+    return 25.0f;
 }
 
 static inline void User_CorrespondSet(uint8_t *ch, uint16_t size)

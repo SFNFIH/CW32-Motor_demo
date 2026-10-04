@@ -1,14 +1,12 @@
 /**
  * @file    interrupts_cw32l012.c
- * @brief   Interrupt Service Routines — SguanFOC 无感
+ * @brief   SguanFOC VF：PWM 中断只跑 High_Loop
  */
 #include "../inc/main.h"
-#include "BSP_Button.h"
-#include "BSP_Current.h"
-#include "BSP_MOTOR.h"
 #include "cw32l012_atim.h"
 #include "cw32l012_btim.h"
 #include "SguanFOC.h"
+#include "Sguan_MotorStatus.h"
 
 extern volatile uint32_t g_millis;
 
@@ -42,8 +40,10 @@ void ATIM_IRQHandler(void)
     if (ATIM_GetITStatus(ATIM_STATE_UIF) != RESET)
     {
         ATIM_ClearITPendingBit(ATIM_STATE_UIF);
-        BSP_Current_Sample();
-        SguanFOC_High_Loop();
+        if (Sguan.status >= MOTOR_STATUS_IDLE)
+        {
+            SguanFOC_High_Loop();
+        }
     }
 }
 
@@ -61,7 +61,7 @@ void BTIM1_IRQHandler(void)
     {
         BTIM_ClearITPendingBit(CW_BTIM1, BTIM_IT_UPDATE);
         g_millis++;
-        BSP_Button_Tick1ms();
+        App_Tick1ms();
         SguanFOC_Low_Loop();
     }
 }

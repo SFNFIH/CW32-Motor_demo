@@ -181,7 +181,8 @@ static inline void User_Parameter_Init(SguanFOC_System_STRUCT *user){
 
     // 15.最速控制结构体
     #if IS_LTD_MODE
-    user->transfer.LTD.r = 1.0f;                    // LTD最速控制->跟踪因子2rad/s合适
+    /* tau≈1/r；r=1 时加速要数秒，电机像没动。50 → 约 20 ms 跟上给定 */
+    user->transfer.LTD.r = 200.0f;
     #endif // IS_LTD_MODE
     
     // 16.霍尔有感结构体

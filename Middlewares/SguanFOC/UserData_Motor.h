@@ -14,7 +14,7 @@ static inline void User_Motor_Init(SguanFOC_System_STRUCT *user){
     user->foc.Target_Id = 0.0f;
     user->foc.Target_Iq = 0.0f;
 
-    user->foc.Target_VF_Uq = 0.0f;
+    user->foc.Target_VF_Uq = 2.5f;
     /* 空载约 0.3A；IF 强拖略高，低阻电机勿过大 */
     user->foc.Target_IF_Iq = 1.5f;
 
@@ -30,6 +30,7 @@ static inline void User_Motor_Init(SguanFOC_System_STRUCT *user){
 
     user->motor.Poles = (uint8_t)MOTOR_POLE_PAIRS;
     user->motor.VBUS = MOTOR_VBUS_V;
+    user->foc.Real_VBUS = MOTOR_VBUS_V;
 
     user->motor.Motor_Dir = 1;
     user->motor.Encoder_Dir = 1;

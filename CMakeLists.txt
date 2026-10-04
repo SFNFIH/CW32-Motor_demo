@@ -35,7 +35,6 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 file(GLOB_RECURSE DRIVER_SOURCES "Libraries/src/*.c")
 list(REMOVE_ITEM DRIVER_SOURCES "${CMAKE_SOURCE_DIR}/Libraries/src/system_cw32l012.c")
 
-# SguanFOC v3.1.0 无感 HFI+SMO (mode 10) 所需源文件
 set(SGUANFOC_SOURCES
     Middlewares/SguanFOC/SguanFOC.c
     Middlewares/SguanFOC/Sguan_math.c

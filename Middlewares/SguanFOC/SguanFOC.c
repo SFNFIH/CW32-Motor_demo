@@ -1626,7 +1626,7 @@ static void PWM_Tick(SguanFOC_System_STRUCT *sguan,
     Value_Limit(&sguan->foc.Dw,1.0f,0.0f);
 
     // 5.电机占空比输出
-    uint32_t Duty_u,Duty_v,Duty_w;
+    uint32_t Duty_u = 0U, Duty_v = 0U, Duty_w = 0U;
     if (sguan->motor.PWM_Dir == 1){
         Duty_u = (uint32_t)(sguan->foc.Du*sguan->motor.Duty);
         Duty_v = (uint32_t)(sguan->foc.Dv*sguan->motor.Duty);
@@ -2124,11 +2124,12 @@ static void Sguan_Calculate_main_Loop(SguanFOC_System_STRUCT *sguan){
         Transfer_Init(sguan);
         Offset_Current_Init(sguan);
 
-#if (IS_IF_MODE || IS_COM_MODE || (CONFIG_MODE == MODE_Sensorless_HFI)) && !IS_DEBUG_MODE
-        /* 纯无感(含 HFI/HS): 不依赖编码器对齐, 保留 User_Motor_Init 的 Motor_Dir */
+#if (IS_IF_MODE || IS_COM_MODE || (CONFIG_MODE == MODE_Sensorless_HFI) || \
+     (CONFIG_MODE == MODE_VF_OPENLOOP)) && !IS_DEBUG_MODE
+        /* VF/无感: 不对齐编码器，避免长时间阻塞主循环 */
         sguan->foc.Ud_in = 0.0f;
         sguan->foc.Uq_in = 0.0f;
-        User_Delay(20);
+        User_Delay(5);
 #else
         // 1.电机强拖到D轴零位
         sguan->foc.Ud_in = 0.0f;
