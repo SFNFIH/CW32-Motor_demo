@@ -1,12 +1,11 @@
 /**
  * @file    interrupts_cw32l012.c
- * @brief   SguanFOC VF：PWM 中断只跑 High_Loop
+ * @brief   HALLTIM 换相中断 + 1ms 节拍
  */
 #include "../inc/main.h"
-#include "cw32l012_atim.h"
+#include "BSP_Button.h"
+#include "BSP_HallBLDC.h"
 #include "cw32l012_btim.h"
-#include "SguanFOC.h"
-#include "Sguan_MotorStatus.h"
 
 extern volatile uint32_t g_millis;
 
@@ -34,19 +33,7 @@ void DMACH34_IRQHandler(void) {}
 void CORDIC_IRQHandler(void) {}
 
 void ADC1_IRQHandler(void) {}
-
-void ATIM_IRQHandler(void)
-{
-    if (ATIM_GetITStatus(ATIM_STATE_UIF) != RESET)
-    {
-        ATIM_ClearITPendingBit(ATIM_STATE_UIF);
-        if (Sguan.status >= MOTOR_STATUS_IDLE)
-        {
-            SguanFOC_High_Loop();
-        }
-    }
-}
-
+void ATIM_IRQHandler(void) {}
 void VC13_IRQHandler(void) {}
 void VC24_IRQHandler(void) {}
 void GTIM1_IRQHandler(void) {}
@@ -61,14 +48,17 @@ void BTIM1_IRQHandler(void)
     {
         BTIM_ClearITPendingBit(CW_BTIM1, BTIM_IT_UPDATE);
         g_millis++;
-        App_Tick1ms();
-        SguanFOC_Low_Loop();
+        BSP_Button_Tick1ms();
     }
 }
 
 void BTIM2_IRQHandler(void) {}
 
-void BTIM3_HALLTIM_IRQHandler(void) {}
+void BTIM3_HALLTIM_IRQHandler(void)
+{
+    /* 霍尔变化 → 读状态 → ATIM 六步换相（不进主循环） */
+    BSP_HallBLDC_IRQHandler();
+}
 
 void I2C1_IRQHandler(void) {}
 void I2C2_IRQHandler(void) {}

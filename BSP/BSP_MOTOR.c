@@ -1,12 +1,20 @@
 /**
  * @file    BSP_MOTOR.c
- * @brief   三相互补 PWM, 三相同时输出
+ * @brief   ATIM 三相互补 PWM，六步方波：导通相 PWM/全开，浮空相关断
  */
 #include "BSP_MOTOR.h"
 #include "cw32l012.h"
 #include "cw32l012_atim.h"
 #include "cw32l012_gpio.h"
 #include "cw32l012_sysctrl.h"
+
+#define CC_ALL  (ATIM_CCER_CC1E_Msk | ATIM_CCER_CC1NE_Msk | \
+                 ATIM_CCER_CC2E_Msk | ATIM_CCER_CC2NE_Msk | \
+                 ATIM_CCER_CC3E_Msk | ATIM_CCER_CC3NE_Msk)
+
+static volatile uint16_t s_duty = 0U;
+static volatile uint8_t  s_step = 0xFFU;
+static volatile uint8_t  s_run;
 
 static void gpio_init(void)
 {
@@ -30,18 +38,26 @@ static void gpio_init(void)
     PB04_AFx_ATIMCH3N();
 }
 
+static void outputs_off(void)
+{
+    CW_ATIM->CCER &= (uint32_t)~CC_ALL;
+    ATIM_SetCompare1(0U);
+    ATIM_SetCompare2(0U);
+    ATIM_SetCompare3(0U);
+}
+
 void BSP_MOTOR_Init(void)
 {
     ATIM_InitTypeDef tim;
     ATIM_OCInitTypeDef oc;
-    uint16_t mid = (uint16_t)(BSP_MOTOR_PWM_ARR / 2U);
 
     gpio_init();
     __SYSCTRL_ATIM_CLK_ENABLE();
     ATIM_DeInit();
 
+    /* 边沿对齐更适合方波六步占空控制 */
     tim.BufferState = ENABLE;
-    tim.CounterAlignedMode = ATIM_COUNT_ALIGN_MODE_CENTER_DOWN;
+    tim.CounterAlignedMode = ATIM_COUNT_ALIGN_MODE_EDGE;
     tim.CounterDirection = ATIM_COUNTING_UP;
     tim.CounterOPMode = ATIM_OP_MODE_REPETITIVE;
     tim.Prescaler = 0U;
@@ -62,13 +78,8 @@ void BSP_MOTOR_Init(void)
     ATIM_CH1Config(ENABLE);
     ATIM_CH2Config(ENABLE);
     ATIM_CH3Config(ENABLE);
-    CW_ATIM->CCER_f.CC1NE = 1U;
-    CW_ATIM->CCER_f.CC2NE = 1U;
-    CW_ATIM->CCER_f.CC3NE = 1U;
 
-    ATIM_SetCompare1(mid);
-    ATIM_SetCompare2(mid);
-    ATIM_SetCompare3(mid);
+    outputs_off();
 
     ATIM_SetPWMDeadtime((int16_t)BSP_MOTOR_PWM_DEADTIME,
                         (int16_t)BSP_MOTOR_PWM_DEADTIME,
@@ -82,43 +93,105 @@ void BSP_MOTOR_Init(void)
 
     ATIM_Cmd(ENABLE);
     ATIM_CtrlPWMOutputs(DISABLE);
+    s_run = 0U;
+    s_duty = 0U;
+    s_step = 0xFFU;
 }
 
-void BSP_MOTOR_SetPhaseDuty(uint16_t da, uint16_t db, uint16_t dc)
+void BSP_MOTOR_SetDuty(uint16_t duty)
 {
-    if (da > BSP_MOTOR_PWM_ARR) { da = BSP_MOTOR_PWM_ARR; }
-    if (db > BSP_MOTOR_PWM_ARR) { db = BSP_MOTOR_PWM_ARR; }
-    if (dc > BSP_MOTOR_PWM_ARR) { dc = BSP_MOTOR_PWM_ARR; }
-    ATIM_SetCompare1(da);
-    ATIM_SetCompare2(db);
-    ATIM_SetCompare3(dc);
+    if (duty > BSP_MOTOR_PWM_ARR)
+    {
+        duty = BSP_MOTOR_PWM_ARR;
+    }
+    s_duty = duty;
+    /* 运行中立刻刷新当前步的 PWM 比较值 */
+    if ((s_run != 0U) && (s_step <= 5U))
+    {
+        BSP_MOTOR_CommutateStep(s_step);
+    }
+}
+
+uint16_t BSP_MOTOR_GetDuty(void)
+{
+    return s_duty;
+}
+
+void BSP_MOTOR_CommutateStep(uint8_t step)
+{
+    uint16_t duty = s_duty;
+    uint32_t ccer;
+
+    if (step > 5U)
+    {
+        return;
+    }
+    s_step = step;
+
+    if (s_run == 0U)
+    {
+        return;
+    }
+
+    /* 先关断全部输出，再按步配置，避免桥臂直通毛刺 */
+    CW_ATIM->CCER &= (uint32_t)~CC_ALL;
+
+    ATIM_SetCompare1(0U);
+    ATIM_SetCompare2(0U);
+    ATIM_SetCompare3(0U);
+
+    switch (step)
+    {
+    case 0U: /* A+ B- */
+        ATIM_SetCompare1(duty);
+        ATIM_SetCompare2(0U);
+        ccer = ATIM_CCER_CC1E_Msk | ATIM_CCER_CC1NE_Msk |
+               ATIM_CCER_CC2E_Msk | ATIM_CCER_CC2NE_Msk;
+        break;
+    case 1U: /* A+ C- */
+        ATIM_SetCompare1(duty);
+        ATIM_SetCompare3(0U);
+        ccer = ATIM_CCER_CC1E_Msk | ATIM_CCER_CC1NE_Msk |
+               ATIM_CCER_CC3E_Msk | ATIM_CCER_CC3NE_Msk;
+        break;
+    case 2U: /* B+ C- */
+        ATIM_SetCompare2(duty);
+        ATIM_SetCompare3(0U);
+        ccer = ATIM_CCER_CC2E_Msk | ATIM_CCER_CC2NE_Msk |
+               ATIM_CCER_CC3E_Msk | ATIM_CCER_CC3NE_Msk;
+        break;
+    case 3U: /* B+ A- */
+        ATIM_SetCompare2(duty);
+        ATIM_SetCompare1(0U);
+        ccer = ATIM_CCER_CC2E_Msk | ATIM_CCER_CC2NE_Msk |
+               ATIM_CCER_CC1E_Msk | ATIM_CCER_CC1NE_Msk;
+        break;
+    case 4U: /* C+ A- */
+        ATIM_SetCompare3(duty);
+        ATIM_SetCompare1(0U);
+        ccer = ATIM_CCER_CC3E_Msk | ATIM_CCER_CC3NE_Msk |
+               ATIM_CCER_CC1E_Msk | ATIM_CCER_CC1NE_Msk;
+        break;
+    default: /* 5: C+ B- */
+        ATIM_SetCompare3(duty);
+        ATIM_SetCompare2(0U);
+        ccer = ATIM_CCER_CC3E_Msk | ATIM_CCER_CC3NE_Msk |
+               ATIM_CCER_CC2E_Msk | ATIM_CCER_CC2NE_Msk;
+        break;
+    }
+
+    CW_ATIM->CCER |= ccer;
 }
 
 void BSP_MOTOR_Start(void)
 {
-    uint16_t mid = (uint16_t)(BSP_MOTOR_PWM_ARR / 2U);
-    BSP_MOTOR_SetPhaseDuty(mid, mid, mid);
+    s_run = 1U;
     ATIM_CtrlPWMOutputs(ENABLE);
 }
 
 void BSP_MOTOR_Stop(void)
 {
-    uint16_t mid = (uint16_t)(BSP_MOTOR_PWM_ARR / 2U);
-    BSP_MOTOR_SetPhaseDuty(mid, mid, mid);
+    s_run = 0U;
+    outputs_off();
     ATIM_CtrlPWMOutputs(DISABLE);
-}
-
-void BSP_MOTOR_EnablePwmIrq(void)
-{
-    ATIM_ClearITPendingBit(ATIM_STATE_UIF);
-    ATIM_ITConfig(ATIM_IT_UIE, ENABLE);
-    NVIC_ClearPendingIRQ(ATIM_IRQn);
-    NVIC_SetPriority(ATIM_IRQn, 1U);
-    NVIC_EnableIRQ(ATIM_IRQn);
-}
-
-void BSP_MOTOR_DisablePwmIrq(void)
-{
-    ATIM_ITConfig(ATIM_IT_UIE, DISABLE);
-    NVIC_DisableIRQ(ATIM_IRQn);
 }
