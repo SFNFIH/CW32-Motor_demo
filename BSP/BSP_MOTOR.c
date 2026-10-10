@@ -105,10 +105,28 @@ void BSP_MOTOR_SetDuty(uint16_t duty)
         duty = BSP_MOTOR_PWM_ARR;
     }
     s_duty = duty;
-    /* 运行中立刻刷新当前步的 PWM 比较值 */
-    if ((s_run != 0U) && (s_step <= 5U))
+
+    /*
+     * 主循环只改占空比：刷新当前导通相的 CCR，不碰 CCER。
+     * 六步换相（改桥臂开关组合）仅由 HALLTIM 中断调用 CommutateStep。
+     */
+    if ((s_run == 0U) || (s_step > 5U))
     {
-        BSP_MOTOR_CommutateStep(s_step);
+        return;
+    }
+    switch (s_step)
+    {
+    case 0U:
+    case 1U:
+        ATIM_SetCompare1(duty);
+        break;
+    case 2U:
+    case 3U:
+        ATIM_SetCompare2(duty);
+        break;
+    default:
+        ATIM_SetCompare3(duty);
+        break;
     }
 }
 

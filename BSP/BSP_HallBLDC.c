@@ -116,8 +116,8 @@ void BSP_HallBLDC_Init(void)
     ht.auto_reload_value = 0x00FFFFFFUL;
     HALLTIM_Init(&ht);
 
-    /* 霍尔信号变化中断 */
-    CW_HALLTIM->DIER_f.CAPIE = 1U;
+    /* 霍尔信号变化中断（CAPIE = CHG） */
+    CW_HALLTIM->DIER = (uint32_t)HALLTIM_DIER_CHG;
     HALLTIM_ClearStatus(HALLTIM_ISR_CHG | HALLTIM_ISR_OV | HALLTIM_ISR_MATCH);
 
     NVIC_ClearPendingIRQ(BTIM3_HALLTIM_IRQn);
